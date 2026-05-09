@@ -15,6 +15,7 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -190,6 +191,22 @@ class DiscordInteractionJsonlWorkQueueSink:
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
         return status
+
+
+@dataclass(frozen=True)
+class DiscordInteractionWorkQueueSummary:
+    """Read-only aggregate view of the local interaction work queue."""
+
+    path: str
+    exists: bool
+    total_rows: int = 0
+    valid_items: int = 0
+    invalid_rows: int = 0
+    queued: int = 0
+    duplicates: int = 0
+    action_counts: dict[str, int] = field(default_factory=dict)
+    review_counts: dict[str, int] = field(default_factory=dict)
+    latest_timestamp: str | None = None
 
 
 @dataclass(frozen=True)
@@ -548,6 +565,120 @@ def record_discord_work_item(
         return "queue_error"
 
 
+def _row_to_work_item(row: dict[str, Any]) -> DiscordInteractionWorkItem | None:
+    allowed = {
+        "work_id",
+        "idempotency_key",
+        "timestamp",
+        "interaction_id",
+        "action",
+        "review_id",
+        "source",
+        "endpoint_version",
+        "status",
+        "kind",
+        "runtime_write",
+        "live_send",
+        "shell",
+        "env_lookup",
+        "signature",
+        "headers",
+    }
+    try:
+        item = DiscordInteractionWorkItem(**{key: value for key, value in row.items() if key in allowed})
+    except TypeError:
+        return None
+    ok, _code = validate_discord_work_item(item)
+    return item if ok else None
+
+
+def inspect_discord_work_queue(path: Path | str) -> DiscordInteractionWorkQueueSummary:
+    """Read and summarize the local queue without applying anything."""
+
+    queue_path = Path(path).expanduser()
+    if not queue_path.exists():
+        return DiscordInteractionWorkQueueSummary(path=str(queue_path), exists=False)
+
+    total_rows = 0
+    invalid_rows = 0
+    valid_items: list[DiscordInteractionWorkItem] = []
+    with queue_path.open("r", encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            total_rows += 1
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                invalid_rows += 1
+                continue
+            if not isinstance(row, dict):
+                invalid_rows += 1
+                continue
+            item = _row_to_work_item(row)
+            if item is None:
+                invalid_rows += 1
+                continue
+            valid_items.append(item)
+
+    action_counts = Counter(item.action for item in valid_items)
+    review_counts = Counter(_redacted_label("review", item.review_id) for item in valid_items)
+    latest = max((item.timestamp for item in valid_items), default=None)
+    return DiscordInteractionWorkQueueSummary(
+        path=str(queue_path),
+        exists=True,
+        total_rows=total_rows,
+        valid_items=len(valid_items),
+        invalid_rows=invalid_rows,
+        queued=sum(1 for item in valid_items if item.status == "queued"),
+        duplicates=sum(1 for item in valid_items if item.status == "duplicate"),
+        action_counts=dict(action_counts),
+        review_counts=dict(review_counts),
+        latest_timestamp=latest,
+    )
+
+
+def _format_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return "없음"
+    return ", ".join(f"{key}: {value}" for key, value in sorted(counts.items()))
+
+
+def _redacted_label(prefix: str, value: str) -> str:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}#{digest}"
+
+
+def render_discord_work_queue_digest_ko(summary: DiscordInteractionWorkQueueSummary) -> str:
+    """Render a Korean read-only digest without raw JSON/log exposure."""
+
+    if not summary.exists or summary.valid_items == 0:
+        return "\n".join(
+            [
+                "Discord 버튼 queue 요약",
+                "- 아직 유효한 버튼 queue가 없습니다.",
+                "- 실제 적용은 아직 하지 않았습니다.",
+                "- DB write 없음.",
+                "- live send 없음.",
+                "- agent 실행 없음.",
+            ]
+        )
+    return "\n".join(
+        [
+            "Discord 버튼 queue 요약",
+            f"- 총 유효 항목: {summary.valid_items}",
+            f"- 대기: {summary.queued}",
+            f"- 중복: {summary.duplicates}",
+            f"- action: {_format_counts(summary.action_counts)}",
+            f"- review: {_format_counts(summary.review_counts)}",
+            f"- 최신 시각: {summary.latest_timestamp or '없음'}",
+            f"- 무효/스킵 행: {summary.invalid_rows}",
+            "- 실제 적용은 아직 하지 않았습니다.",
+            "- DB write 없음. live send 없음. agent 실행 없음.",
+        ]
+    )
+
+
 def _safe_route_path(value: Any) -> str:
     path = str(value or DISCORD_INTERACTION_ROUTE).strip()
     if not path.startswith("/") or "//" in path or any(ch in path for ch in "\r\n\x00"):
@@ -764,12 +895,12 @@ def build_discord_ack_preview(payload: dict[str, Any], dry_run_result: Any = Non
     parsed = _parse_component(payload)
     if parsed is None:
         return None
-    action, review_id = parsed
+    action, _review_id = parsed
     return {
         "type": 4,
         "data": {
             "flags": 64,
-            "content": f"MIM dry-run: {action} / {review_id}",
+            "content": f"MIM dry-run: {action} queued",
         },
     }
 
