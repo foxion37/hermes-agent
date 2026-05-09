@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import importlib
 import json
+import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import Any, cast
 
 pytest = importlib.import_module("pytest")
@@ -33,6 +36,7 @@ from gateway.discord_interactions import (
     DiscordInteractionReplayCache,
     DiscordInteractionRunnerResult,
     DiscordInteractionWorkItem,
+    DiscordInteractionWorkQueueSummary,
     build_discord_interaction_engine,
     default_discord_signature_verifier,
     resolve_discord_interaction_config,
@@ -40,6 +44,8 @@ from gateway.discord_interactions import (
     validate_discord_feedback_event,
     validate_discord_interaction_timestamp,
     validate_discord_work_item,
+    inspect_discord_work_queue,
+    render_discord_work_queue_digest_ko,
 )
 
 
@@ -371,6 +377,136 @@ async def test_non_component_payload_with_custom_id_does_not_call_preview_runner
         assert data["error"] == "unsupported_interaction"
 
     assert runner.called is False
+
+
+def test_queue_inspector_script_prints_read_only_korean_digest(tmp_path):
+    path = tmp_path / "work-queue.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "kind": "discord_interaction_work_item",
+                "work_id": "work-script",
+                "idempotency_key": "interaction-script:approve:review-script",
+                "timestamp": "2026-05-09T00:00:00Z",
+                "interaction_id": "interaction-script",
+                "action": "approve",
+                "review_id": "review-script",
+                "source": "discord_interaction_livegate",
+                "endpoint_version": "soma-v1",
+                "status": "queued",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    script = Path(__file__).resolve().parents[2] / "scripts" / "discord_interaction_queue_inspect.py"
+
+    result = subprocess.run([sys.executable, str(script), str(path)], capture_output=True, text=True, check=True)
+
+    assert "Discord 버튼 queue 요약" in result.stdout
+    assert "총 유효 항목: 1" in result.stdout
+    assert "approve: 1" in result.stdout
+    assert "DB write 없음" in result.stdout
+
+
+def test_work_queue_inspector_summarizes_fixture_without_applying(tmp_path):
+    path = tmp_path / "work-queue.jsonl"
+    rows = [
+        {
+            "kind": "discord_interaction_work_item",
+            "work_id": "work-a",
+            "idempotency_key": "interaction-a:approve:review-a",
+            "timestamp": "2026-05-09T00:00:00Z",
+            "interaction_id": "interaction-a",
+            "action": "approve",
+            "review_id": "review-a",
+            "source": "discord_interaction_livegate",
+            "endpoint_version": "soma-v1",
+            "status": "queued",
+        },
+        {
+            "kind": "discord_interaction_work_item",
+            "work_id": "work-b",
+            "idempotency_key": "interaction-b:reject:review-b",
+            "timestamp": "2026-05-09T00:01:00Z",
+            "interaction_id": "interaction-b",
+            "action": "reject",
+            "review_id": "review-b",
+            "source": "discord_interaction_livegate",
+            "endpoint_version": "soma-v1",
+            "status": "queued",
+        },
+        {
+            "kind": "discord_interaction_work_item",
+            "work_id": "work-c",
+            "idempotency_key": "interaction-a:approve:review-a",
+            "timestamp": "2026-05-09T00:02:00Z",
+            "interaction_id": "interaction-a",
+            "action": "approve",
+            "review_id": "review-a",
+            "source": "discord_interaction_livegate",
+            "endpoint_version": "soma-v1",
+            "status": "duplicate",
+        },
+        {"kind": "discord_interaction_work_item", "headers": {"X-Signature-Ed25519": "bad"}},
+        {"not": "json-enough"},
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    summary = inspect_discord_work_queue(path)
+
+    assert summary == DiscordInteractionWorkQueueSummary(
+        path=str(path),
+        exists=True,
+        total_rows=5,
+        valid_items=3,
+        invalid_rows=2,
+        queued=2,
+        duplicates=1,
+        action_counts={"approve": 2, "reject": 1},
+        review_counts={"review#0c263c7e": 2, "review#7b6f1114": 1},
+        latest_timestamp="2026-05-09T00:02:00Z",
+    )
+
+
+def test_work_queue_digest_is_korean_read_only_and_progressive(tmp_path):
+    path = tmp_path / "missing-work-queue.jsonl"
+
+    missing = inspect_discord_work_queue(path)
+    missing_digest = render_discord_work_queue_digest_ko(missing)
+
+    assert "아직 유효한 버튼 queue가 없습니다" in missing_digest
+    assert "DB write 없음" in missing_digest
+    assert "agent 실행 없음" in missing_digest
+
+    path.write_text(
+        json.dumps(
+            {
+                "kind": "discord_interaction_work_item",
+                "work_id": "work-a",
+                "idempotency_key": "interaction-a:defer:review-a",
+                "timestamp": "2026-05-09T00:00:00Z",
+                "interaction_id": "interaction-a",
+                "action": "defer",
+                "review_id": "review-a",
+                "source": "discord_interaction_livegate",
+                "endpoint_version": "soma-v1",
+                "status": "queued",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    digest = render_discord_work_queue_digest_ko(inspect_discord_work_queue(path))
+
+    assert "Discord 버튼 queue 요약" in digest
+    assert "총 유효 항목: 1" in digest
+    assert "defer: 1" in digest
+    assert "review#0c263c7e: 1" in digest
+    assert "review-a" not in digest
+    assert "실제 적용은 아직 하지 않았습니다" in digest
+    assert "X-Signature" not in digest
 
 
 @pytest.mark.asyncio
@@ -806,7 +942,7 @@ async def test_component_interaction_returns_ephemeral_dry_run_ack_without_apply
     assert data["data"]["flags"] == 64
     assert "dry-run" in data["data"]["content"]
     assert "approve" in data["data"]["content"]
-    assert "review-123" in data["data"]["content"]
+    assert "review-123" not in data["data"]["content"]
 
 
 @pytest.mark.asyncio
