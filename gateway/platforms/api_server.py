@@ -35,6 +35,7 @@ import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -45,6 +46,14 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.discord_interactions import (
+    DiscordInteractionJsonlFeedbackSink,
+    DiscordInteractionReplayCache,
+    build_discord_interaction_engine,
+    default_discord_signature_verifier,
+    handle_discord_interaction_request,
+    resolve_discord_interaction_config,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -611,6 +620,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._discord_interaction_config = resolve_discord_interaction_config(extra)
+        self._discord_interaction_verifier = default_discord_signature_verifier
+        self._discord_interaction_dry_run_handler = None
+        self._discord_interaction_replay_cache = DiscordInteractionReplayCache()
+        self._discord_interaction_feedback_sink = self._build_discord_interaction_feedback_sink(extra)
+        self._discord_interaction_feedback_idempotency_keys: set[str] = set()
+        self._discord_interaction_engine = build_discord_interaction_engine(
+            self._discord_interaction_config.engine_name
+        )
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -785,6 +803,64 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
+
+    # ------------------------------------------------------------------
+    # Discord interaction local gate
+    # ------------------------------------------------------------------
+
+    def _build_discord_interaction_feedback_sink(self, extra: dict[str, Any]) -> Any:
+        """Build an optional append-only local artifact sink.
+
+        This deliberately writes JSONL files only when configured. It never
+        opens a runtime DB and never captures raw headers/signatures.
+        """
+
+        section = (extra or {}).get("discord_interactions") or {}
+        if not isinstance(section, dict):
+            return None
+        feedback = section.get("feedback_events") or {}
+        if feedback is False:
+            return None
+        if not isinstance(feedback, dict):
+            feedback = {}
+        enabled = feedback.get("enabled") is True or bool(feedback.get("path")) or bool(section.get("feedback_path"))
+        if not enabled:
+            return None
+        raw_path = feedback.get("path") or section.get("feedback_path")
+        if raw_path:
+            path = Path(str(raw_path)).expanduser()
+        else:
+            from hermes_constants import get_hermes_home
+
+            path = get_hermes_home() / "discord-interactions" / "feedback.jsonl"
+        return DiscordInteractionJsonlFeedbackSink(path)
+
+    def _register_discord_interaction_route(self, app: "web.Application") -> bool:
+        """Mount the Discord interaction route only when explicitly enabled.
+
+        This is a local/test-only safety gate. The default verifier fails
+        closed, so live Discord ACKs require a later approved dependency/config
+        slice. No endpoint registration or gateway restart happens here.
+        """
+
+        config = self._discord_interaction_config
+        if not config.enabled:
+            return False
+
+        async def _handler(request: "web.Request") -> "web.Response":
+            return await handle_discord_interaction_request(
+                request,
+                config=config,
+                verifier=self._discord_interaction_verifier,
+                dry_run_handler=self._discord_interaction_dry_run_handler,
+                replay_cache=self._discord_interaction_replay_cache,
+                feedback_sink=self._discord_interaction_feedback_sink,
+                feedback_idempotency_keys=self._discord_interaction_feedback_idempotency_keys,
+                engine=self._discord_interaction_engine,
+            )
+
+        app.router.add_post(config.route_path, _handler)
+        return True
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -3291,6 +3367,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
+            self._register_discord_interaction_route(self._app)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
             # Cron jobs management API
