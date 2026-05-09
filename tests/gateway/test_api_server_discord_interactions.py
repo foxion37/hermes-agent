@@ -29,14 +29,17 @@ from gateway.discord_interactions import (
     DiscordInteractionEngineResult,
     DiscordInteractionFeedbackEvent,
     DiscordInteractionJsonlFeedbackSink,
+    DiscordInteractionJsonlWorkQueueSink,
     DiscordInteractionReplayCache,
     DiscordInteractionRunnerResult,
+    DiscordInteractionWorkItem,
     build_discord_interaction_engine,
     default_discord_signature_verifier,
     resolve_discord_interaction_config,
     validate_discord_dry_run_result,
     validate_discord_feedback_event,
     validate_discord_interaction_timestamp,
+    validate_discord_work_item,
 )
 
 
@@ -368,6 +371,184 @@ async def test_non_component_payload_with_custom_id_does_not_call_preview_runner
         assert data["error"] == "unsupported_interaction"
 
     assert runner.called is False
+
+
+@pytest.mark.asyncio
+async def test_component_interaction_enqueues_safe_work_item_outside_callback_apply():
+    class MemorySink:
+        def __init__(self):
+            self.events = []
+
+        def record(self, event):
+            self.events.append(event)
+            return "recorded"
+
+    class MemoryQueue:
+        def __init__(self):
+            self.items = []
+
+        def enqueue(self, item):
+            self.items.append(item)
+            return "queued"
+
+    feedback_sink = MemorySink()
+    queue_sink = MemoryQueue()
+    adapter = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key"}})
+    adapter._discord_interaction_verifier = lambda **_kwargs: True
+    adapter._discord_interaction_feedback_sink = feedback_sink
+    adapter._discord_interaction_work_queue_sink = queue_sink
+    app = web.Application()
+    adapter._register_discord_interaction_route(app)
+
+    payload = {
+        "type": 3,
+        "id": "interaction-queue-1",
+        "data": {"custom_id": "mim:soma-review:v1:defer:review-queue"},
+    }
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "sig-queue-1",
+                "X-Signature-Timestamp": _fresh_timestamp(),
+            },
+        )
+        data = await resp.json()
+
+    assert resp.status == 200
+    assert data["type"] == 4
+    assert len(feedback_sink.events) == 1
+    assert len(queue_sink.items) == 1
+    item = queue_sink.items[0]
+    assert item.kind == "discord_interaction_work_item"
+    assert item.interaction_id == "interaction-queue-1"
+    assert item.action == "defer"
+    assert item.review_id == "review-queue"
+    assert item.idempotency_key == "interaction-queue-1:defer:review-queue"
+    assert item.status == "queued"
+    assert item.runtime_write is False
+    assert item.shell is False
+    assert item.env_lookup is False
+    assert not hasattr(item, "payload")
+
+
+@pytest.mark.asyncio
+async def test_invalid_signature_timestamp_replay_and_non_component_do_not_enqueue_work_item():
+    class MemoryQueue:
+        def __init__(self):
+            self.items = []
+
+        def enqueue(self, item):
+            self.items.append(item)
+            return "queued"
+
+    queue_sink = MemoryQueue()
+    adapter = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key"}})
+    adapter._discord_interaction_verifier = lambda **_kwargs: False
+    adapter._discord_interaction_work_queue_sink = queue_sink
+    app = web.Application()
+    adapter._register_discord_interaction_route(app)
+
+    async with TestClient(TestServer(app)) as cli:
+        bad_sig = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=b'{"type":3,"id":"interaction-badq","data":{"custom_id":"mim:soma-review:v1:approve:review-1"}}',
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "bad-sig",
+                "X-Signature-Timestamp": _fresh_timestamp(),
+            },
+        )
+        bad_time = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=b'{"type":3,"id":"interaction-timeq","data":{"custom_id":"mim:soma-review:v1:approve:review-1"}}',
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "sig-time",
+                "X-Signature-Timestamp": "+123",
+            },
+        )
+
+    assert bad_sig.status == 401
+    assert bad_time.status == 401
+    assert queue_sink.items == []
+
+    adapter2 = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key"}})
+    adapter2._discord_interaction_verifier = lambda **_kwargs: True
+    adapter2._discord_interaction_work_queue_sink = queue_sink
+    app2 = web.Application()
+    adapter2._register_discord_interaction_route(app2)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Signature-Ed25519": "sig-replay-no-queue",
+        "X-Signature-Timestamp": _fresh_timestamp(),
+    }
+    body = b'{"type":3,"id":"interaction-replay-no-queue","data":{"custom_id":"mim:soma-review:v1:approve:review-1"}}'
+    async with TestClient(TestServer(app2)) as cli:
+        first = await cli.post(DISCORD_INTERACTION_ROUTE, data=body, headers=headers)
+        second = await cli.post(DISCORD_INTERACTION_ROUTE, data=body, headers=headers)
+        non_component = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=b'{"type":2,"id":"interaction-non-componentq","data":{"custom_id":"mim:soma-review:v1:approve:review-1"}}',
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "sig-non-componentq",
+                "X-Signature-Timestamp": _fresh_timestamp(),
+            },
+        )
+
+    assert first.status == 200
+    assert second.status == 409
+    assert non_component.status == 400
+    assert [item.interaction_id for item in queue_sink.items] == ["interaction-replay-no-queue"]
+
+
+def test_work_item_validation_blocks_runtime_shell_env_and_secret_fields():
+    item = DiscordInteractionWorkItem(
+        work_id="work-1",
+        idempotency_key="interaction:approve:review-1",
+        timestamp="2026-05-09T00:00:00Z",
+        interaction_id="interaction",
+        action="approve",
+        review_id="review-1",
+        source="discord_interaction_livegate",
+        endpoint_version="soma-v1",
+        status="queued",
+    )
+    assert validate_discord_work_item(item) == (True, "ok")
+
+    unsafe_items = [
+        item.__class__(**{**item.__dict__, "runtime_write": True}),
+        item.__class__(**{**item.__dict__, "shell": True}),
+        item.__class__(**{**item.__dict__, "env_lookup": True}),
+        item.__class__(**{**item.__dict__, "review_id": "DISCORD_BOT_TOKEN"}),
+    ]
+    for unsafe in unsafe_items:
+        assert validate_discord_work_item(unsafe)[0] is False
+
+
+def test_jsonl_work_queue_sink_is_append_only_and_idempotent(tmp_path):
+    path = tmp_path / "work-queue.jsonl"
+    sink = DiscordInteractionJsonlWorkQueueSink(path)
+    item = DiscordInteractionWorkItem(
+        work_id="work-1",
+        idempotency_key="interaction:approve:review-1",
+        timestamp="2026-05-09T00:00:00Z",
+        interaction_id="interaction",
+        action="approve",
+        review_id="review-1",
+        source="discord_interaction_livegate",
+        endpoint_version="soma-v1",
+        status="queued",
+    )
+
+    assert sink.enqueue(item) == "queued"
+    assert sink.enqueue(item.__class__(**{**item.__dict__, "work_id": "work-2"})) == "duplicate"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [row["status"] for row in rows] == ["queued", "duplicate"]
+    assert all("payload" not in row and "headers" not in row and "signature" not in row for row in rows)
 
 
 @pytest.mark.asyncio

@@ -50,6 +50,8 @@ _FEEDBACK_KIND = "discord_interaction_feedback"
 _FEEDBACK_SOURCE = "discord_interaction_livegate"
 _FEEDBACK_ENDPOINT_VERSION = "soma-v1"
 _FEEDBACK_RESULTS = {"preview_ack", "duplicate"}
+_WORK_ITEM_KIND = "discord_interaction_work_item"
+_WORK_ITEM_STATUSES = {"queued", "duplicate"}
 
 
 class DiscordInteractionFeedbackSink(Protocol):
@@ -118,6 +120,76 @@ class DiscordInteractionJsonlFeedbackSink:
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
         return event_result if event_result == "duplicate" else "recorded"
+
+
+class DiscordInteractionWorkQueueSink(Protocol):
+    """Append-only destination for later work outside the HTTP callback."""
+
+    def enqueue(self, item: "DiscordInteractionWorkItem") -> str:
+        """Append the work item and return `queued` or `duplicate`."""
+
+
+@dataclass(frozen=True)
+class DiscordInteractionWorkItem:
+    """Sanitized queue item for a later worker outside the callback path.
+
+    It carries only the reviewed decision contract. It cannot claim runtime DB
+    writes, shell execution, env lookup, or live sends from the callback.
+    """
+
+    work_id: str
+    idempotency_key: str
+    timestamp: str
+    interaction_id: str
+    action: str
+    review_id: str
+    source: str
+    endpoint_version: str
+    status: str
+    kind: str = _WORK_ITEM_KIND
+    runtime_write: bool = False
+    live_send: bool = False
+    shell: bool = False
+    env_lookup: bool = False
+    signature: str | None = None
+    headers: dict[str, Any] | None = None
+
+
+@dataclass
+class DiscordInteractionJsonlWorkQueueSink:
+    """Append-only JSONL work queue for future async processing.
+
+    This is a local artifact seam only. A later worker may read it, but the
+    Discord callback never runs that worker inline.
+    """
+
+    path: Path | str
+    _seen_keys: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        self.path = Path(self.path)
+        if self.path.exists():
+            for line in self.path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = row.get("idempotency_key")
+                if isinstance(key, str):
+                    self._seen_keys.add(key)
+
+    def enqueue(self, item: DiscordInteractionWorkItem) -> str:
+        status = "duplicate" if item.idempotency_key in self._seen_keys else item.status
+        item_to_write = DiscordInteractionWorkItem(**{**asdict(item), "status": status})
+        ok, code = validate_discord_work_item(item_to_write)
+        if not ok:
+            return code
+        self._seen_keys.add(item_to_write.idempotency_key)
+        row = _work_item_to_json_row(item_to_write)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+        return status
 
 
 @dataclass(frozen=True)
@@ -287,6 +359,13 @@ def _feedback_event_to_json_row(event: DiscordInteractionFeedbackEvent) -> dict[
     return row
 
 
+def _work_item_to_json_row(item: DiscordInteractionWorkItem) -> dict[str, Any]:
+    row = asdict(item)
+    row.pop("signature", None)
+    row.pop("headers", None)
+    return row
+
+
 def validate_discord_feedback_event(event: Any) -> tuple[bool, str]:
     """Validate that feedback rows contain only safe append-only fields."""
 
@@ -377,6 +456,96 @@ def record_discord_feedback_event(
         return sink.record(event)
     except Exception:
         return "sink_error"
+
+
+def validate_discord_work_item(item: Any) -> tuple[bool, str]:
+    """Validate local queue rows before a future worker can consume them."""
+
+    if not isinstance(item, DiscordInteractionWorkItem):
+        return False, "invalid_work_item"
+    if item.kind != _WORK_ITEM_KIND:
+        return False, "invalid_work_item_kind"
+    if item.source != _FEEDBACK_SOURCE or item.endpoint_version != _FEEDBACK_ENDPOINT_VERSION:
+        return False, "invalid_work_item_source"
+    if item.signature or item.headers:
+        return False, "unsafe_work_item"
+    if item.runtime_write or item.live_send or item.shell or item.env_lookup:
+        return False, "unsafe_work_item"
+    if item.action not in {"approve", "reject", "defer"}:
+        return False, "invalid_work_item_action"
+    if item.status not in _WORK_ITEM_STATUSES:
+        return False, "invalid_work_item_status"
+    if not _safe_component(item.interaction_id) or not _safe_component(item.review_id):
+        return False, "unsafe_work_item"
+    expected_key = f"{item.interaction_id}:{item.action}:{item.review_id}"
+    if item.idempotency_key != expected_key:
+        return False, "invalid_work_item_idempotency_key"
+    if not isinstance(item.work_id, str) or not item.work_id or _contains_secret_marker(item.work_id):
+        return False, "unsafe_work_item"
+    if not isinstance(item.timestamp, str) or any(ch in item.timestamp for ch in "\r\n\x00"):
+        return False, "unsafe_work_item"
+    return True, "ok"
+
+
+def build_discord_work_item(
+    *,
+    payload: dict[str, Any],
+    action: str,
+    review_id: str,
+    status: str,
+) -> DiscordInteractionWorkItem | None:
+    """Create a sanitized queue item for later processing outside the route."""
+
+    interaction_id = payload.get("id")
+    if not _safe_component(interaction_id) or not _safe_component(review_id):
+        return None
+    idempotency_key = f"{interaction_id}:{action}:{review_id}"
+    work_hash = hashlib.sha256(("work:" + idempotency_key).encode("utf-8")).hexdigest()[:16]
+    item = DiscordInteractionWorkItem(
+        work_id=f"discord-work-{work_hash}",
+        idempotency_key=idempotency_key,
+        timestamp=_utc_timestamp(),
+        interaction_id=interaction_id,
+        action=action,
+        review_id=review_id,
+        source=_FEEDBACK_SOURCE,
+        endpoint_version=_FEEDBACK_ENDPOINT_VERSION,
+        status=status,
+    )
+    ok, _code = validate_discord_work_item(item)
+    return item if ok else None
+
+
+def record_discord_work_item(
+    *,
+    sink: DiscordInteractionWorkQueueSink | None,
+    idempotency_keys: set[str] | None,
+    payload: dict[str, Any],
+) -> str:
+    """Append a queue item for later workers without running the work inline."""
+
+    if sink is None:
+        return "disabled"
+    if payload.get("type") != 3:
+        return "skipped"
+    parsed = _parse_component(payload)
+    if parsed is None:
+        return "skipped"
+    action, review_id = parsed
+    interaction_id = payload.get("id")
+    if not isinstance(interaction_id, str):
+        return "skipped"
+    idempotency_key = f"{interaction_id}:{action}:{review_id}"
+    status = "duplicate" if idempotency_keys is not None and idempotency_key in idempotency_keys else "queued"
+    if idempotency_keys is not None:
+        idempotency_keys.add(idempotency_key)
+    item = build_discord_work_item(payload=payload, action=action, review_id=review_id, status=status)
+    if item is None:
+        return "invalid"
+    try:
+        return sink.enqueue(item)
+    except Exception:
+        return "queue_error"
 
 
 def _safe_route_path(value: Any) -> str:
@@ -614,6 +783,8 @@ async def handle_discord_interaction_request(
     replay_cache: DiscordInteractionReplayCache | None = None,
     feedback_sink: DiscordInteractionFeedbackSink | None = None,
     feedback_idempotency_keys: set[str] | None = None,
+    work_queue_sink: DiscordInteractionWorkQueueSink | None = None,
+    work_queue_idempotency_keys: set[str] | None = None,
     engine: DiscordInteractionEngine | None = None,
     now: Callable[[], float] | float | None = None,
 ):
@@ -685,6 +856,11 @@ async def handle_discord_interaction_request(
     record_discord_feedback_event(
         sink=feedback_sink,
         idempotency_keys=feedback_idempotency_keys,
+        payload=payload,
+    )
+    record_discord_work_item(
+        sink=work_queue_sink,
+        idempotency_keys=work_queue_idempotency_keys,
         payload=payload,
     )
     return _aiohttp_web().json_response(ack)
