@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 import json
 import time
+from typing import Any, cast
 
 pytest = importlib.import_module("pytest")
 web = importlib.import_module("aiohttp.web")
@@ -27,6 +28,8 @@ from gateway.discord_interactions import (
     DiscordInteractionConfig,
     DiscordInteractionEngineResult,
     DiscordInteractionReplayCache,
+    DiscordInteractionRunnerResult,
+    build_discord_interaction_engine,
     default_discord_signature_verifier,
     resolve_discord_interaction_config,
     validate_discord_dry_run_result,
@@ -111,6 +114,68 @@ def test_discord_interaction_config_rejects_arbitrary_agent_engine_names():
     assert config.enabled is False
     assert config.public_key == ""
     assert config.engine_name == "preview"
+
+
+def test_engine_factory_allows_only_preview_registry_names():
+    assert build_discord_interaction_engine("preview").name == "preview"
+    assert build_discord_interaction_engine("mim-preview").name == "mim-preview"
+    assert build_discord_interaction_engine("mim_preview").name == "mim_preview"
+
+    with pytest.raises(ValueError, match="unsupported_discord_interaction_engine"):
+        build_discord_interaction_engine("subprocess:claude-code")
+
+
+def test_preview_runner_receives_only_validated_contract_input_not_raw_payload():
+    class Runner:
+        def __init__(self):
+            self.inputs = []
+
+        def propose_ack(self, runner_input):
+            self.inputs.append(runner_input)
+            return DiscordInteractionRunnerResult(content=f"runner preview: {runner_input.action} / {runner_input.review_id}")
+
+    runner = Runner()
+    engine = build_discord_interaction_engine("mim-preview", runner=runner)
+    result = engine.build_ack(
+        {"type": 3, "id": "interaction-runner", "data": {"custom_id": "mim:soma-review:v1:approve:review-123"}}
+    )
+
+    assert len(runner.inputs) == 1
+    runner_input = runner.inputs[0]
+    assert runner_input.action == "approve"
+    assert runner_input.review_id == "review-123"
+    assert runner_input.interaction_type == 3
+    assert runner_input.interaction_id == "interaction-runner"
+    assert not hasattr(runner_input, "payload")
+    assert result == DiscordInteractionEngineResult(
+        engine_name="mim-preview",
+        ack={"type": 4, "data": {"flags": 64, "content": "runner preview: approve / review-123"}},
+    )
+
+
+def test_preview_runner_result_rejects_side_effect_or_secret_shaped_output():
+    class UnsafeRunner:
+        def __init__(self, result):
+            self.result = result
+
+        def propose_ack(self, _runner_input):
+            return self.result
+
+    payload = {"type": 3, "id": "interaction-runner", "data": {"custom_id": "mim:soma-review:v1:approve:review-123"}}
+
+    unsafe_results = [
+        DiscordInteractionRunnerResult(content="ok", live_send=True),
+        DiscordInteractionRunnerResult(content="ok", runtime_write=True),
+        DiscordInteractionRunnerResult(content="ok", shell=True),
+        DiscordInteractionRunnerResult(content="ok", env_lookup=True),
+        DiscordInteractionRunnerResult(content="secret-token should not echo"),
+        {"content": "not a typed result"},
+    ]
+
+    for unsafe in unsafe_results:
+        engine = build_discord_interaction_engine("mim-preview", runner=cast(Any, UnsafeRunner(unsafe)))
+        result = engine.build_ack(payload)
+        assert result == DiscordInteractionEngineResult(ack=None, engine_name="mim-preview", runtime_write=True)
 
 
 @pytest.mark.asyncio
@@ -231,6 +296,75 @@ async def test_invalid_signature_fails_before_engine_wrapper_call():
         assert data["error"] == "invalid_signature"
 
     assert engine.called is False
+
+
+@pytest.mark.asyncio
+async def test_bad_timestamp_fails_before_preview_runner_call():
+    class Runner:
+        def __init__(self):
+            self.called = False
+
+        def propose_ack(self, _runner_input):
+            self.called = True
+            return DiscordInteractionRunnerResult(content="should not run")
+
+    runner = Runner()
+    adapter = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key", "engine": "mim-preview"}})
+    adapter._discord_interaction_verifier = lambda **_kwargs: True
+    adapter._discord_interaction_engine = build_discord_interaction_engine("mim-preview", runner=cast(Any, runner))
+    app = web.Application()
+    adapter._register_discord_interaction_route(app)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=b'{"type":1}',
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "sig-bad-time",
+                "X-Signature-Timestamp": "+123",
+            },
+        )
+        assert resp.status == 401
+        data = await resp.json()
+        assert data["error"] == "invalid_timestamp"
+
+    assert runner.called is False
+
+
+@pytest.mark.asyncio
+async def test_non_component_payload_with_custom_id_does_not_call_preview_runner():
+    class Runner:
+        def __init__(self):
+            self.called = False
+
+        def propose_ack(self, _runner_input):
+            self.called = True
+            return DiscordInteractionRunnerResult(content="should not run")
+
+    runner = Runner()
+    adapter = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key", "engine": "mim-preview"}})
+    adapter._discord_interaction_verifier = lambda **_kwargs: True
+    adapter._discord_interaction_engine = build_discord_interaction_engine("mim-preview", runner=cast(Any, runner))
+    app = web.Application()
+    adapter._register_discord_interaction_route(app)
+
+    payload = {"type": 2, "id": "interaction-not-component", "data": {"custom_id": "mim:soma-review:v1:approve:review-123"}}
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "sig-not-component",
+                "X-Signature-Timestamp": _fresh_timestamp(),
+            },
+        )
+        assert resp.status == 400
+        data = await resp.json()
+        assert data["error"] == "unsupported_interaction"
+
+    assert runner.called is False
 
 
 @pytest.mark.asyncio

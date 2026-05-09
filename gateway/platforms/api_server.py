@@ -47,7 +47,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.discord_interactions import (
     DiscordInteractionReplayCache,
-    PreviewDiscordInteractionEngine,
+    build_discord_interaction_engine,
     default_discord_signature_verifier,
     handle_discord_interaction_request,
     resolve_discord_interaction_config,
@@ -622,8 +622,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._discord_interaction_verifier = default_discord_signature_verifier
         self._discord_interaction_dry_run_handler = None
         self._discord_interaction_replay_cache = DiscordInteractionReplayCache()
-        self._discord_interaction_engine = PreviewDiscordInteractionEngine(
-            name=self._discord_interaction_config.engine_name
+        self._discord_interaction_engine = build_discord_interaction_engine(
+            self._discord_interaction_config.engine_name
         )
 
     @staticmethod

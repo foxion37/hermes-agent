@@ -42,6 +42,7 @@ _BLOCKED_PUBLIC_KEY_ENV_MARKERS = (
 _CUSTOM_ID_RE = re.compile(r"^mim:soma-review:v1:(approve|reject|defer):([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})$")
 _ASCII_DECIMAL_RE = re.compile(r"^[0-9]{1,20}$")
 _ALLOWED_ENGINE_NAMES = {"preview", "mim-preview", "mim_preview"}
+_RUNNER_CONTENT_MAX_LENGTH = 512
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,46 @@ class DiscordInteractionEngineResult:
     live_send: bool = False
     runtime_write: bool = False
     applied: bool = False
+
+
+@dataclass(frozen=True)
+class DiscordInteractionRunnerInput:
+    """Validated component data passed to a preview runner.
+
+    This intentionally omits the raw Discord payload so a future Hermes/Codex/
+    Claude/OpenCode wrapper receives only the button decision contract, not
+    headers, signatures, tokens, or arbitrary interaction JSON.
+    """
+
+    action: str
+    review_id: str
+    interaction_type: int
+    interaction_id: str
+
+
+@dataclass(frozen=True)
+class DiscordInteractionRunnerResult:
+    """Typed preview-only ACK proposal from a local runner.
+
+    The forbidden flags document the approval gate. A later live runner may add
+    a separate contract, but this pre-gate runner cannot claim live sends,
+    runtime writes, shell execution, or env/secret lookup.
+    """
+
+    content: str
+    response_type: int = 4
+    flags: int = 64
+    live_send: bool = False
+    runtime_write: bool = False
+    shell: bool = False
+    env_lookup: bool = False
+
+
+class DiscordInteractionPreviewRunner(Protocol):
+    """Preview-only agent runner contract used behind the engine seam."""
+
+    def propose_ack(self, runner_input: DiscordInteractionRunnerInput) -> DiscordInteractionRunnerResult:
+        """Return a typed local ACK proposal without side effects."""
 
 
 class DiscordInteractionEngine(Protocol):
@@ -74,9 +115,20 @@ class PreviewDiscordInteractionEngine:
     """Default preview-only engine before any live apply gate exists."""
 
     name: str = "preview"
+    runner: DiscordInteractionPreviewRunner | None = None
 
     def build_ack(self, payload: dict[str, Any]) -> DiscordInteractionEngineResult:
-        return DiscordInteractionEngineResult(ack=build_discord_ack_preview(payload), engine_name=self.name)
+        if self.runner is None:
+            return DiscordInteractionEngineResult(ack=build_discord_ack_preview(payload), engine_name=self.name)
+
+        runner_input = build_discord_runner_input(payload)
+        if runner_input is None:
+            return DiscordInteractionEngineResult(ack=None, engine_name=self.name)
+        try:
+            runner_result = self.runner.propose_ack(runner_input)
+        except Exception:
+            return DiscordInteractionEngineResult(ack=None, engine_name=self.name, runtime_write=True)
+        return runner_result_to_engine_result(runner_result, engine_name=self.name)
 
 
 @dataclass(frozen=True)
@@ -277,6 +329,69 @@ def _parse_component(payload: dict[str, Any]) -> tuple[str, str] | None:
     if not match:
         return None
     return match.group(1), match.group(2)
+
+
+def _contains_secret_marker(value: str) -> bool:
+    return _looks_like_secret_env(value)
+
+
+def build_discord_runner_input(payload: dict[str, Any]) -> DiscordInteractionRunnerInput | None:
+    """Build the narrow preview-runner input from a validated component payload."""
+
+    if payload.get("type") != 3:
+        return None
+    parsed = _parse_component(payload)
+    if parsed is None:
+        return None
+    interaction_id = payload.get("id")
+    if not isinstance(interaction_id, str) or len(interaction_id) > 128 or any(ch in interaction_id for ch in "\r\n\x00"):
+        return None
+    action, review_id = parsed
+    return DiscordInteractionRunnerInput(
+        action=action,
+        review_id=review_id,
+        interaction_type=3,
+        interaction_id=interaction_id,
+    )
+
+
+def runner_result_to_engine_result(result: Any, *, engine_name: str) -> DiscordInteractionEngineResult:
+    """Convert a typed runner proposal into a Discord ACK or fail closed."""
+
+    if not isinstance(result, DiscordInteractionRunnerResult):
+        return DiscordInteractionEngineResult(ack=None, engine_name=engine_name, runtime_write=True)
+    if result.live_send or result.runtime_write or result.shell or result.env_lookup:
+        return DiscordInteractionEngineResult(ack=None, engine_name=engine_name, runtime_write=True)
+    if type(result.response_type) is not int or result.response_type != 4:
+        return DiscordInteractionEngineResult(ack=None, engine_name=engine_name, runtime_write=True)
+    if type(result.flags) is not int or result.flags != 64:
+        return DiscordInteractionEngineResult(ack=None, engine_name=engine_name, runtime_write=True)
+    if type(result.content) is not str or not result.content or len(result.content) > _RUNNER_CONTENT_MAX_LENGTH:
+        return DiscordInteractionEngineResult(ack=None, engine_name=engine_name, runtime_write=True)
+    if any(ch in result.content for ch in "\r\n\x00") or _contains_secret_marker(result.content):
+        return DiscordInteractionEngineResult(ack=None, engine_name=engine_name, runtime_write=True)
+    return DiscordInteractionEngineResult(
+        engine_name=engine_name,
+        ack={"type": result.response_type, "data": {"flags": result.flags, "content": result.content}},
+    )
+
+
+def build_discord_interaction_engine(
+    engine_name: str,
+    *,
+    runner: DiscordInteractionPreviewRunner | None = None,
+) -> DiscordInteractionEngine:
+    """Build an allowlisted local interaction engine.
+
+    This is a registry seam, not a plugin loader. Config cannot name Python
+    import paths, shell commands, or external agents. Future agent-specific
+    wrappers must be wired as trusted objects by gateway code after review.
+    """
+
+    normalized = str(engine_name or "preview").strip().lower()
+    if normalized not in _ALLOWED_ENGINE_NAMES:
+        raise ValueError("unsupported_discord_interaction_engine")
+    return PreviewDiscordInteractionEngine(name=normalized, runner=runner)
 
 
 def build_discord_ack_preview(payload: dict[str, Any], dry_run_result: Any = None) -> dict[str, Any] | None:
