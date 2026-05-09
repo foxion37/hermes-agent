@@ -50,6 +50,7 @@ from gateway.discord_interactions import (
 )
 from scripts.discord_interaction_decision_note import (
     DEFAULT_LIVE_Q_VAULT,
+    promote_discord_decision_note_to_live_vault,
     write_discord_decision_note_dry_run,
     write_discord_decision_note_to_temp_vault,
 )
@@ -483,6 +484,85 @@ def test_decision_note_dry_run_script_writes_artifact_without_live_vault(tmp_pat
     content = note_path.read_text(encoding="utf-8")
     assert "status: dry-run" in content
     assert "live Q vault write 없음" in content
+    assert "아직 유효한 버튼 queue가 없습니다" in content
+
+
+def test_promote_decision_note_writes_canonical_live_vault_note_idempotently(tmp_path):
+    queue = tmp_path / "work-queue.jsonl"
+    queue.write_text(
+        json.dumps(
+            {
+                "kind": "discord_interaction_work_item",
+                "work_id": "work-promote-id",
+                "idempotency_key": "interaction-promote:approve:review-promote-id",
+                "timestamp": "2026-05-09T00:00:00Z",
+                "interaction_id": "interaction-promote",
+                "action": "approve",
+                "review_id": "review-promote-id",
+                "source": "discord_interaction_livegate",
+                "endpoint_version": "soma-v1",
+                "status": "queued",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    summary = inspect_discord_work_queue(queue)
+    live_vault = tmp_path / "Q"
+
+    note_path = promote_discord_decision_note_to_live_vault(live_vault, summary, created="2026-05-09")
+    second_path = promote_discord_decision_note_to_live_vault(live_vault, summary, created="2026-05-09")
+
+    assert second_path == note_path
+    assert note_path == live_vault / "30_PROJECTS/Mount-Improbable/MEMORY/decisions/2026-05-09-discord-livegate-feedback-policy.md"
+    content = note_path.read_text(encoding="utf-8")
+    assert "status: canonical" in content
+    assert "live Q vault write 완료" in content
+    assert "review#" in content
+    assert "interaction-promote" not in content
+    assert "work-promote-id" not in content
+    assert "review-promote-id" not in content
+    assert "token" not in content.lower()
+    assert "signature" not in content.lower()
+
+
+def test_promote_decision_note_refuses_to_overwrite_different_existing_note(tmp_path):
+    summary = inspect_discord_work_queue(tmp_path / "missing.jsonl")
+    live_vault = tmp_path / "Q"
+    note_path = live_vault / "30_PROJECTS/Mount-Improbable/MEMORY/decisions/2026-05-09-discord-livegate-feedback-policy.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text("existing canonical note\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="different decision note already exists"):
+        promote_discord_decision_note_to_live_vault(live_vault, summary, created="2026-05-09")
+
+
+def test_decision_note_promote_script_writes_canonical_note(tmp_path):
+    queue = tmp_path / "missing.jsonl"
+    live_vault = tmp_path / "Q"
+    script = Path(__file__).resolve().parents[2] / "scripts" / "discord_interaction_decision_note_promote.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--queue-path",
+            str(queue),
+            "--vault-root",
+            str(live_vault),
+            "--created",
+            "2026-05-09",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    note_path = Path(result.stdout.strip())
+    assert note_path == live_vault / "30_PROJECTS/Mount-Improbable/MEMORY/decisions/2026-05-09-discord-livegate-feedback-policy.md"
+    content = note_path.read_text(encoding="utf-8")
+    assert "status: canonical" in content
+    assert "live Q vault write 완료" in content
     assert "아직 유효한 버튼 queue가 없습니다" in content
 
 
@@ -1170,7 +1250,7 @@ def test_jsonl_feedback_sink_is_append_only_and_idempotent(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_component_interaction_returns_ephemeral_dry_run_ack_without_apply():
+async def test_component_interaction_returns_ephemeral_queue_ack_without_apply():
     adapter = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key"}})
     calls = []
 
@@ -1204,7 +1284,8 @@ async def test_component_interaction_returns_ephemeral_dry_run_ack_without_apply
     assert calls == []
     assert data["type"] == 4
     assert data["data"]["flags"] == 64
-    assert "dry-run" in data["data"]["content"]
+    assert "dry-run" not in data["data"]["content"]
+    assert "queued" in data["data"]["content"]
     assert "approve" in data["data"]["content"]
     assert "review-123" not in data["data"]["content"]
 

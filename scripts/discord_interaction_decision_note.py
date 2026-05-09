@@ -1,8 +1,13 @@
-"""Dry-run Obsidian decision-note writer for Discord livegate feedback.
+"""Obsidian decision-note writer for Discord livegate feedback.
 
-This module is deliberately side-effect-light. It can prove the note layout in a
-throwaway temp vault and can write a local dry-run Markdown artifact. It must not
-write Q's live Obsidian vault until a later explicit promotion gate.
+This module has two paths:
+
+* temp/dry-run writers for safe previews;
+* an explicit live-vault promotion writer for the already-approved canonical
+  decision note.
+
+Both paths keep the Discord callback thin. They never write runtime DBs, send
+messages, run agents, or include raw Discord payload/secret material.
 """
 
 from __future__ import annotations
@@ -55,19 +60,51 @@ def _decision_note_path(vault_root: Path | str, *, created: str, slug: str) -> P
     return target_dir / f"{created}-{slug}.md"
 
 
-def render_discord_decision_note(summary: DiscordInteractionWorkQueueSummary, *, created: str, slug: str) -> str:
-    """Render sanitized Korean Markdown for later Obsidian promotion."""
+def render_discord_decision_note(
+    summary: DiscordInteractionWorkQueueSummary,
+    *,
+    created: str,
+    slug: str,
+    status: str = "dry-run",
+) -> str:
+    """Render sanitized Korean Markdown for Obsidian decision-note promotion."""
 
     created = _validate_component(created, label="created")
     slug = _validate_component(slug, label="slug")
+    status = _validate_component(status, label="status")
+    is_canonical = status == "canonical"
     digest = render_discord_work_queue_digest_ko(summary, verbose=True)
+    summary_line = (
+        "- Discord 버튼 피드백 적용 정책을 live Q vault에 canonical decision으로 승격한 노트입니다."
+        if is_canonical
+        else "- Discord 버튼 피드백을 Obsidian-first 방식으로 승격하기 위한 dry-run 결정 노트입니다."
+    )
+    promotion_line = "- live Q vault write 완료." if is_canonical else "- 이 파일은 live Q vault promotion 전 preview입니다."
+    next_lines = (
+        [
+            "- live Q vault write 완료.",
+            "- 다음 단계는 callback 밖 실제 루프/자기개선형 MIM worker 설계입니다.",
+            "- runtime DB write 없음.",
+            "- live send 없음.",
+            "- agent 실행 없음.",
+        ]
+        if is_canonical
+        else [
+            "- live Q vault write는 아직 하지 않습니다.",
+            "- temp-vault TDD와 dry-run artifact 검수 후 별도 gate에서 promote합니다.",
+            "- runtime DB write 없음.",
+            "- live send 없음.",
+            "- agent 실행 없음.",
+            "- live Q vault write 없음.",
+        ]
+    )
     return "\n".join(
         [
             "---",
             f"id: {created}-{slug}",
             "type: decision",
             "area: discord-livegate",
-            "status: dry-run",
+            f"status: {status}",
             f"created: {created}",
             "source: discord_interaction_work_queue",
             "runtime_db_write: false",
@@ -79,9 +116,10 @@ def render_discord_decision_note(summary: DiscordInteractionWorkQueueSummary, *,
             "",
             "## 요약",
             "",
-            "- Discord 버튼 피드백을 Obsidian-first 방식으로 승격하기 위한 dry-run 결정 노트입니다.",
-            "- 이 파일은 live Q vault promotion 전 preview입니다.",
-            "- raw Discord payload, raw credential material, and raw interaction/work/idempotency/review ID are excluded.",
+            summary_line,
+            promotion_line,
+            "- raw Discord payload and raw credential material are excluded.",
+            "- raw interaction/work/idempotency/review IDs are excluded.",
             "",
             "## 판단",
             "",
@@ -96,12 +134,7 @@ def render_discord_decision_note(summary: DiscordInteractionWorkQueueSummary, *,
             "",
             "## 다음 적용",
             "",
-            "- live Q vault write는 아직 하지 않습니다.",
-            "- temp-vault TDD와 dry-run artifact 검수 후 별도 gate에서 promote합니다.",
-            "- runtime DB write 없음.",
-            "- live send 없음.",
-            "- agent 실행 없음.",
-            "- live Q vault write 없음.",
+            *next_lines,
             "",
             "## 연결",
             "",
@@ -151,4 +184,37 @@ def write_discord_decision_note_dry_run(
     target_dir.mkdir(parents=True, exist_ok=True)
     note_path = target_dir / f"{created}-{slug}.md"
     note_path.write_text(render_discord_decision_note(summary, created=created, slug=slug), encoding="utf-8")
+    return note_path
+
+
+def promote_discord_decision_note_to_live_vault(
+    vault_root: Path | str,
+    summary: DiscordInteractionWorkQueueSummary,
+    *,
+    created: str,
+    slug: str = "discord-livegate-feedback-policy",
+    overwrite: bool = False,
+) -> Path:
+    """Write the canonical decision note into the supplied Obsidian vault.
+
+    This is an explicit promotion path, not callback code. It writes one Markdown
+    note under ``MEMORY/decisions/`` and remains idempotent: an identical existing
+    note is accepted; a different existing note is refused unless ``overwrite`` is
+    set by an operator-facing CLI.
+    """
+
+    root = _resolve(vault_root)
+    note_path = _decision_note_path(root, created=created, slug=slug)
+    target_dir = note_path.parent.resolve()
+    if not _is_relative_to(target_dir, root):
+        raise ValueError("decision note escaped live vault root")
+    content = render_discord_decision_note(summary, created=created, slug=slug, status="canonical")
+    if note_path.exists():
+        current = note_path.read_text(encoding="utf-8")
+        if current == content:
+            return note_path
+        if not overwrite:
+            raise FileExistsError("different decision note already exists")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    note_path.write_text(content, encoding="utf-8")
     return note_path

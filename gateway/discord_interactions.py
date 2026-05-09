@@ -3,7 +3,7 @@
 This module is intentionally small and fail-closed. It only builds the
 server-side shape needed to receive Discord interaction callbacks safely:
 read raw bytes, verify timestamp/signature headers first, reject replayed
-requests, then build a dry-run ACK preview. It does not register a Discord
+requests, then build a fast ephemeral queue ACK. It does not register a Discord
 endpoint, send network messages, or apply approval decisions.
 """
 
@@ -976,7 +976,7 @@ def build_discord_ack_preview(payload: dict[str, Any], dry_run_result: Any = Non
     """Build a Discord interaction ACK preview after signature verification.
 
     Type 1 is Discord PING and must return PONG (`{"type": 1}`). Type 3 is a
-    component interaction; this helper returns an ephemeral dry-run message. It
+    component interaction; this helper returns an ephemeral queue message. It
     never applies approval decisions, writes runtime state, or echoes handler
     output back to Discord.
     """
@@ -996,7 +996,7 @@ def build_discord_ack_preview(payload: dict[str, Any], dry_run_result: Any = Non
         "type": 4,
         "data": {
             "flags": 64,
-            "content": f"MIM dry-run: {action} queued",
+            "content": f"MIM queued: {action}",
         },
     }
 
