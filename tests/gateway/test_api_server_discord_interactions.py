@@ -48,6 +48,11 @@ from gateway.discord_interactions import (
     inspect_discord_work_queue,
     render_discord_work_queue_digest_ko,
 )
+from scripts.discord_interaction_decision_note import (
+    DEFAULT_LIVE_Q_VAULT,
+    write_discord_decision_note_dry_run,
+    write_discord_decision_note_to_temp_vault,
+)
 
 
 def _adapter(extra: dict | None = None) -> APIServerAdapter:
@@ -378,6 +383,107 @@ async def test_non_component_payload_with_custom_id_does_not_call_preview_runner
         assert data["error"] == "unsupported_interaction"
 
     assert runner.called is False
+
+
+def test_obsidian_decision_note_writer_uses_temp_vault_and_redacts_raw_ids(tmp_path):
+    queue = tmp_path / "work-queue.jsonl"
+    queue.write_text(
+        json.dumps(
+            {
+                "kind": "discord_interaction_work_item",
+                "work_id": "work-raw-id",
+                "idempotency_key": "interaction-raw:approve:review-raw-id",
+                "timestamp": "2026-05-09T00:00:00Z",
+                "interaction_id": "interaction-raw",
+                "action": "approve",
+                "review_id": "review-raw-id",
+                "source": "discord_interaction_livegate",
+                "endpoint_version": "soma-v1",
+                "status": "queued",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    summary = inspect_discord_work_queue(queue)
+    vault = tmp_path / "temp-vault"
+
+    note_path = write_discord_decision_note_to_temp_vault(
+        vault,
+        summary,
+        created="2026-05-09",
+        slug="discord-livegate-feedback-policy",
+    )
+
+    assert note_path == vault / "30_PROJECTS/Mount-Improbable/MEMORY/decisions/2026-05-09-discord-livegate-feedback-policy.md"
+    content = note_path.read_text(encoding="utf-8")
+    assert "type: decision" in content
+    assert "discord-livegate-feedback-policy" in content
+    assert "## 요약" in content
+    assert "## 판단" in content
+    assert "## 다음 적용" in content
+    assert "review#" in content
+    assert "interaction-raw" not in content
+    assert "work-raw-id" not in content
+    assert "interaction-raw:approve:review-raw-id" not in content
+    assert "review-raw-id" not in content
+    assert "signature" not in content.lower()
+    assert "token" not in content.lower()
+
+
+def test_obsidian_decision_note_writer_rejects_live_q_vault_and_unsafe_slug(tmp_path):
+    summary = inspect_discord_work_queue(tmp_path / "missing.jsonl")
+
+    with pytest.raises(ValueError, match="live Q vault"):
+        write_discord_decision_note_to_temp_vault(DEFAULT_LIVE_Q_VAULT, summary, created="2026-05-09")
+
+    with pytest.raises(ValueError, match="safe path component"):
+        write_discord_decision_note_to_temp_vault(tmp_path / "temp-vault", summary, created="2026-05-09", slug="../bad")
+
+
+def test_obsidian_decision_note_dry_run_writes_only_under_artifact_dir(tmp_path):
+    summary = inspect_discord_work_queue(tmp_path / "missing.jsonl")
+    artifact_root = tmp_path / ".hermes" / "dry-runs"
+
+    note_path = write_discord_decision_note_dry_run(
+        artifact_root,
+        summary,
+        created="2026-05-09",
+        slug="discord-livegate-feedback-policy",
+    )
+
+    assert note_path.parent == artifact_root / "discord-livegate-decision-notes"
+    assert note_path.name == "2026-05-09-discord-livegate-feedback-policy.md"
+    assert "live Q vault write 없음" in note_path.read_text(encoding="utf-8")
+
+
+def test_decision_note_dry_run_script_writes_artifact_without_live_vault(tmp_path):
+    queue = tmp_path / "missing.jsonl"
+    artifact_root = tmp_path / "artifacts"
+    script = Path(__file__).resolve().parents[2] / "scripts" / "discord_interaction_decision_note_dry_run.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--queue-path",
+            str(queue),
+            "--artifact-root",
+            str(artifact_root),
+            "--created",
+            "2026-05-09",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    note_path = Path(result.stdout.strip())
+    assert note_path == artifact_root / "discord-livegate-decision-notes/2026-05-09-discord-livegate-feedback-policy.md"
+    content = note_path.read_text(encoding="utf-8")
+    assert "status: dry-run" in content
+    assert "live Q vault write 없음" in content
+    assert "아직 유효한 버튼 queue가 없습니다" in content
 
 
 def test_queue_inspector_script_prints_read_only_korean_digest(tmp_path):
