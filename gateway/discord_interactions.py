@@ -16,7 +16,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, cast
+from typing import Any, Callable, Protocol, cast
 
 
 def _aiohttp_web() -> Any:
@@ -41,6 +41,42 @@ _BLOCKED_PUBLIC_KEY_ENV_MARKERS = (
 )
 _CUSTOM_ID_RE = re.compile(r"^mim:soma-review:v1:(approve|reject|defer):([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})$")
 _ASCII_DECIMAL_RE = re.compile(r"^[0-9]{1,20}$")
+_ALLOWED_ENGINE_NAMES = {"preview", "mim-preview", "mim_preview"}
+
+
+@dataclass(frozen=True)
+class DiscordInteractionEngineResult:
+    """ACK plus explicit side-effect claims from a local wrapper engine."""
+
+    ack: dict[str, Any] | None
+    engine_name: str = "preview"
+    live_send: bool = False
+    runtime_write: bool = False
+    applied: bool = False
+
+
+class DiscordInteractionEngine(Protocol):
+    """Safe seam for fork-local interaction engines.
+
+    This protocol lets Q/MIM swap the local decision engine later without
+    letting Discord config import arbitrary callables, shell out, or contact
+    external agents from the callback route itself.
+    """
+
+    name: str
+
+    def build_ack(self, payload: dict[str, Any]) -> DiscordInteractionEngineResult:
+        """Return an ACK preview without live sends or runtime writes."""
+
+
+@dataclass(frozen=True)
+class PreviewDiscordInteractionEngine:
+    """Default preview-only engine before any live apply gate exists."""
+
+    name: str = "preview"
+
+    def build_ack(self, payload: dict[str, Any]) -> DiscordInteractionEngineResult:
+        return DiscordInteractionEngineResult(ack=build_discord_ack_preview(payload), engine_name=self.name)
 
 
 @dataclass(frozen=True)
@@ -55,6 +91,7 @@ class DiscordInteractionConfig:
     enabled: bool = False
     public_key: str = ""
     route_path: str = DISCORD_INTERACTION_ROUTE
+    engine_name: str = "preview"
 
 
 @dataclass
@@ -127,18 +164,22 @@ def resolve_discord_interaction_config(extra: dict[str, Any] | None) -> DiscordI
     if not isinstance(section, dict) or section.get("enabled") is not True:
         return DiscordInteractionConfig()
 
+    route_path = _safe_route_path(section.get("route") or section.get("route_path"))
+    engine_name = str(section.get("engine") or section.get("engine_name") or "preview").strip().lower()
+    if engine_name not in _ALLOWED_ENGINE_NAMES:
+        return DiscordInteractionConfig(route_path=route_path)
+
     public_key = str(section.get("public_key") or "").strip()
     public_key_env = str(section.get("public_key_env") or "").strip()
     if not public_key and public_key_env:
         if public_key_env not in _ALLOWED_PUBLIC_KEY_ENV_NAMES or _looks_like_secret_env(public_key_env):
-            return DiscordInteractionConfig(route_path=_safe_route_path(section.get("route") or section.get("route_path")))
+            return DiscordInteractionConfig(route_path=route_path)
         public_key = os.getenv(public_key_env, "").strip()
 
-    route_path = _safe_route_path(section.get("route") or section.get("route_path"))
     if not public_key:
         return DiscordInteractionConfig(route_path=route_path)
 
-    return DiscordInteractionConfig(enabled=True, public_key=public_key, route_path=route_path)
+    return DiscordInteractionConfig(enabled=True, public_key=public_key, route_path=route_path, engine_name=engine_name)
 
 
 def validate_discord_interaction_timestamp(
@@ -198,6 +239,16 @@ def validate_discord_dry_run_result(result: Any) -> tuple[bool, str]:
     for field_name in ("live_send", "runtime_write", "db_write", "applied", "apply"):
         if result.get(field_name) is True:
             return False, "unsafe_dry_run_result"
+    return True, "ok"
+
+
+def validate_discord_engine_result(result: Any) -> tuple[bool, str]:
+    """Reject local engine results that claim side effects."""
+
+    if not isinstance(result, DiscordInteractionEngineResult):
+        return False, "unsafe_engine_result"
+    if result.live_send or result.runtime_write or result.applied:
+        return False, "unsafe_engine_result"
     return True, "ok"
 
 
@@ -264,6 +315,7 @@ async def handle_discord_interaction_request(
     verifier: Callable[..., bool] | None = None,
     dry_run_handler: Callable[[dict[str, Any]], Any] | None = None,
     replay_cache: DiscordInteractionReplayCache | None = None,
+    engine: DiscordInteractionEngine | None = None,
     now: Callable[[], float] | float | None = None,
 ):
     """Handle a Discord interaction callback in local/dry-run mode.
@@ -322,9 +374,13 @@ async def handle_discord_interaction_request(
     # before returning. A later live apply gate must introduce a side-effect-safe
     # executor contract under separate review.
     _ = dry_run_handler
-    dry_run_result = None
+    selected_engine = engine or PreviewDiscordInteractionEngine()
+    engine_result = selected_engine.build_ack(payload)
+    engine_ok, engine_code = validate_discord_engine_result(engine_result)
+    if not engine_ok:
+        return _error_response(engine_code, 500)
 
-    ack = build_discord_ack_preview(payload, dry_run_result)
+    ack = engine_result.ack
     if ack is None:
         return _error_response("unsupported_interaction", 400)
     return _aiohttp_web().json_response(ack)

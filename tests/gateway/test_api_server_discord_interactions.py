@@ -25,6 +25,7 @@ from gateway.platforms.api_server import APIServerAdapter
 from gateway.discord_interactions import (
     DISCORD_INTERACTION_ROUTE,
     DiscordInteractionConfig,
+    DiscordInteractionEngineResult,
     DiscordInteractionReplayCache,
     default_discord_signature_verifier,
     resolve_discord_interaction_config,
@@ -79,6 +80,37 @@ def test_discord_interaction_config_accepts_only_public_key_source(monkeypatch):
         public_key="abc123",
         route_path=DISCORD_INTERACTION_ROUTE,
     )
+
+
+def test_discord_interaction_config_accepts_only_local_preview_engines():
+    config = resolve_discord_interaction_config(
+        {
+            "discord_interactions": {
+                "enabled": True,
+                "public_key": "public-key",
+                "engine": "mim-preview",
+            }
+        }
+    )
+
+    assert config.enabled is True
+    assert config.engine_name == "mim-preview"
+
+
+def test_discord_interaction_config_rejects_arbitrary_agent_engine_names():
+    config = resolve_discord_interaction_config(
+        {
+            "discord_interactions": {
+                "enabled": True,
+                "public_key": "public-key",
+                "engine": "subprocess:claude-code",
+            }
+        }
+    )
+
+    assert config.enabled is False
+    assert config.public_key == ""
+    assert config.engine_name == "preview"
 
 
 @pytest.mark.asyncio
@@ -166,6 +198,42 @@ async def test_invalid_signature_fails_before_json_parse_or_dry_run():
 
 
 @pytest.mark.asyncio
+async def test_invalid_signature_fails_before_engine_wrapper_call():
+    class TrackingEngine:
+        name = "mim-preview"
+
+        def __init__(self):
+            self.called = False
+
+        def build_ack(self, _payload):
+            self.called = True
+            return DiscordInteractionEngineResult(ack={"type": 1}, engine_name=self.name)
+
+    engine = TrackingEngine()
+    adapter = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key", "engine": "mim-preview"}})
+    adapter._discord_interaction_verifier = lambda **_kwargs: False
+    adapter._discord_interaction_engine = engine
+    app = web.Application()
+    adapter._register_discord_interaction_route(app)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=b"not-json-but-signature-fails-first",
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "bad-sig",
+                "X-Signature-Timestamp": _fresh_timestamp(),
+            },
+        )
+        assert resp.status == 401
+        data = await resp.json()
+        assert data["error"] == "invalid_signature"
+
+    assert engine.called is False
+
+
+@pytest.mark.asyncio
 async def test_component_interaction_returns_ephemeral_dry_run_ack_without_apply():
     adapter = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key"}})
     calls = []
@@ -203,6 +271,89 @@ async def test_component_interaction_returns_ephemeral_dry_run_ack_without_apply
     assert "dry-run" in data["data"]["content"]
     assert "approve" in data["data"]["content"]
     assert "review-123" in data["data"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_injected_preview_engine_can_build_safe_local_ack_after_verification():
+    class FakeEngine:
+        name = "mim-preview"
+
+        def __init__(self):
+            self.payloads = []
+
+        def build_ack(self, payload):
+            self.payloads.append(payload)
+            return DiscordInteractionEngineResult(
+                engine_name=self.name,
+                ack={"type": 4, "data": {"flags": 64, "content": "local wrapper preview"}},
+            )
+
+    engine = FakeEngine()
+    adapter = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key", "engine": "mim-preview"}})
+    adapter._discord_interaction_verifier = lambda **_kwargs: True
+    adapter._discord_interaction_engine = engine
+    app = web.Application()
+    adapter._register_discord_interaction_route(app)
+
+    payload = {
+        "type": 3,
+        "id": "interaction-wrapper-1",
+        "data": {"custom_id": "mim:soma-review:v1:defer:review-456"},
+    }
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "sig-wrapper-1",
+                "X-Signature-Timestamp": _fresh_timestamp(),
+            },
+        )
+        assert resp.status == 200
+        data = await resp.json()
+
+    assert engine.payloads == [payload]
+    assert data == {"type": 4, "data": {"flags": 64, "content": "local wrapper preview"}}
+
+
+@pytest.mark.asyncio
+async def test_injected_engine_side_effect_claim_fails_closed_without_echoing_content():
+    class UnsafeEngine:
+        name = "mim-preview"
+
+        def build_ack(self, _payload):
+            return DiscordInteractionEngineResult(
+                engine_name=self.name,
+                ack={"type": 4, "data": {"flags": 64, "content": "secret-token applied"}},
+                runtime_write=True,
+            )
+
+    adapter = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key", "engine": "mim-preview"}})
+    adapter._discord_interaction_verifier = lambda **_kwargs: True
+    adapter._discord_interaction_engine = UnsafeEngine()
+    app = web.Application()
+    adapter._register_discord_interaction_route(app)
+
+    payload = {
+        "type": 3,
+        "id": "interaction-wrapper-2",
+        "data": {"custom_id": "mim:soma-review:v1:approve:review-789"},
+    }
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "sig-wrapper-2",
+                "X-Signature-Timestamp": _fresh_timestamp(),
+            },
+        )
+        assert resp.status == 500
+        data = await resp.json()
+
+    assert data == {"error": "unsafe_engine_result"}
 
 
 @pytest.mark.asyncio

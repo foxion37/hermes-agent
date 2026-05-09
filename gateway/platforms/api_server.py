@@ -47,6 +47,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.discord_interactions import (
     DiscordInteractionReplayCache,
+    PreviewDiscordInteractionEngine,
     default_discord_signature_verifier,
     handle_discord_interaction_request,
     resolve_discord_interaction_config,
@@ -621,6 +622,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._discord_interaction_verifier = default_discord_signature_verifier
         self._discord_interaction_dry_run_handler = None
         self._discord_interaction_replay_cache = DiscordInteractionReplayCache()
+        self._discord_interaction_engine = PreviewDiscordInteractionEngine(
+            name=self._discord_interaction_config.engine_name
+        )
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -819,6 +823,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 verifier=self._discord_interaction_verifier,
                 dry_run_handler=self._discord_interaction_dry_run_handler,
                 replay_cache=self._discord_interaction_replay_cache,
+                engine=self._discord_interaction_engine,
             )
 
         app.router.add_post(config.route_path, _handler)
