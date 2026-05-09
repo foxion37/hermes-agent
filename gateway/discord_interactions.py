@@ -15,7 +15,9 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Callable, Protocol, cast
 
 
@@ -40,9 +42,82 @@ _BLOCKED_PUBLIC_KEY_ENV_MARKERS = (
     "BEARER",
 )
 _CUSTOM_ID_RE = re.compile(r"^mim:soma-review:v1:(approve|reject|defer):([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})$")
+_SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _ASCII_DECIMAL_RE = re.compile(r"^[0-9]{1,20}$")
 _ALLOWED_ENGINE_NAMES = {"preview", "mim-preview", "mim_preview"}
 _RUNNER_CONTENT_MAX_LENGTH = 512
+_FEEDBACK_KIND = "discord_interaction_feedback"
+_FEEDBACK_SOURCE = "discord_interaction_livegate"
+_FEEDBACK_ENDPOINT_VERSION = "soma-v1"
+_FEEDBACK_RESULTS = {"preview_ack", "duplicate"}
+
+
+class DiscordInteractionFeedbackSink(Protocol):
+    """Append-only destination for safe interaction feedback events."""
+
+    def record(self, event: "DiscordInteractionFeedbackEvent") -> str:
+        """Append the event and return `recorded` or `duplicate`."""
+
+
+@dataclass(frozen=True)
+class DiscordInteractionFeedbackEvent:
+    """Sanitized append-only event produced after a safe Discord ACK preview.
+
+    This is the first MIM learning-loop artifact. It intentionally stores only
+    the decision contract and deterministic idempotency key. Raw headers,
+    signatures, bot tokens, and full Discord payloads are not part of the event.
+    """
+
+    event_id: str
+    idempotency_key: str
+    timestamp: str
+    interaction_id: str
+    action: str
+    review_id: str
+    source: str
+    endpoint_version: str
+    result: str
+    kind: str = _FEEDBACK_KIND
+    signature: str | None = None
+    headers: dict[str, Any] | None = None
+
+
+@dataclass
+class DiscordInteractionJsonlFeedbackSink:
+    """Append-only JSONL sink with local idempotency tracking.
+
+    This writes a local artifact only. It does not open or mutate a runtime DB.
+    Duplicate clicks append a second sanitized row marked `duplicate`, so the log
+    remains append-only while downstream consumers can collapse by key.
+    """
+
+    path: Path | str
+    _seen_keys: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        self.path = Path(self.path)
+        if self.path.exists():
+            for line in self.path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = row.get("idempotency_key")
+                if isinstance(key, str):
+                    self._seen_keys.add(key)
+
+    def record(self, event: DiscordInteractionFeedbackEvent) -> str:
+        event_result = "duplicate" if event.idempotency_key in self._seen_keys else event.result
+        event_to_write = DiscordInteractionFeedbackEvent(**{**asdict(event), "result": event_result})
+        ok, code = validate_discord_feedback_event(event_to_write)
+        if not ok:
+            return code
+        self._seen_keys.add(event_to_write.idempotency_key)
+        row = _feedback_event_to_json_row(event_to_write)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+        return event_result if event_result == "duplicate" else "recorded"
 
 
 @dataclass(frozen=True)
@@ -195,6 +270,113 @@ class DiscordInteractionReplayCache:
 def _looks_like_secret_env(name: str) -> bool:
     upper = name.upper()
     return any(marker in upper for marker in _BLOCKED_PUBLIC_KEY_ENV_MARKERS)
+
+
+def _safe_component(value: Any) -> bool:
+    return isinstance(value, str) and _SAFE_COMPONENT_RE.fullmatch(value) is not None and not _contains_secret_marker(value)
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _feedback_event_to_json_row(event: DiscordInteractionFeedbackEvent) -> dict[str, Any]:
+    row = asdict(event)
+    row.pop("signature", None)
+    row.pop("headers", None)
+    return row
+
+
+def validate_discord_feedback_event(event: Any) -> tuple[bool, str]:
+    """Validate that feedback rows contain only safe append-only fields."""
+
+    if not isinstance(event, DiscordInteractionFeedbackEvent):
+        return False, "invalid_feedback_event"
+    if event.kind != _FEEDBACK_KIND:
+        return False, "invalid_feedback_kind"
+    if event.source != _FEEDBACK_SOURCE or event.endpoint_version != _FEEDBACK_ENDPOINT_VERSION:
+        return False, "invalid_feedback_source"
+    if event.signature or event.headers:
+        return False, "unsafe_feedback_event"
+    if event.action not in {"approve", "reject", "defer"}:
+        return False, "invalid_feedback_action"
+    if event.result not in _FEEDBACK_RESULTS:
+        return False, "invalid_feedback_result"
+    if not _safe_component(event.interaction_id) or not _safe_component(event.review_id):
+        return False, "unsafe_feedback_event"
+    expected_key = f"{event.interaction_id}:{event.action}:{event.review_id}"
+    if event.idempotency_key != expected_key:
+        return False, "invalid_feedback_idempotency_key"
+    if not isinstance(event.event_id, str) or not event.event_id or _contains_secret_marker(event.event_id):
+        return False, "unsafe_feedback_event"
+    if not isinstance(event.timestamp, str) or any(ch in event.timestamp for ch in "\r\n\x00"):
+        return False, "unsafe_feedback_event"
+    return True, "ok"
+
+
+def build_discord_feedback_event(
+    *,
+    payload: dict[str, Any],
+    action: str,
+    review_id: str,
+    result: str,
+) -> DiscordInteractionFeedbackEvent | None:
+    """Create a sanitized MIM feedback event from a validated component."""
+
+    interaction_id = payload.get("id")
+    if not _safe_component(interaction_id) or not _safe_component(review_id):
+        return None
+    idempotency_key = f"{interaction_id}:{action}:{review_id}"
+    event_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:16]
+    event = DiscordInteractionFeedbackEvent(
+        event_id=f"discord-feedback-{event_hash}",
+        idempotency_key=idempotency_key,
+        timestamp=_utc_timestamp(),
+        interaction_id=interaction_id,
+        action=action,
+        review_id=review_id,
+        source=_FEEDBACK_SOURCE,
+        endpoint_version=_FEEDBACK_ENDPOINT_VERSION,
+        result=result,
+    )
+    ok, _code = validate_discord_feedback_event(event)
+    return event if ok else None
+
+
+def record_discord_feedback_event(
+    *,
+    sink: DiscordInteractionFeedbackSink | None,
+    idempotency_keys: set[str] | None,
+    payload: dict[str, Any],
+) -> str:
+    """Append a sanitized event after ACK construction.
+
+    Missing sink means disabled local artifact capture. This is not an error for
+    the Discord callback because ACK speed and safety are the first priority.
+    """
+
+    if sink is None:
+        return "disabled"
+    if payload.get("type") != 3:
+        return "skipped"
+    parsed = _parse_component(payload)
+    if parsed is None:
+        return "skipped"
+    action, review_id = parsed
+    interaction_id = payload.get("id")
+    if not isinstance(interaction_id, str):
+        return "skipped"
+    idempotency_key = f"{interaction_id}:{action}:{review_id}"
+    result = "duplicate" if idempotency_keys is not None and idempotency_key in idempotency_keys else "preview_ack"
+    if idempotency_keys is not None:
+        idempotency_keys.add(idempotency_key)
+    event = build_discord_feedback_event(payload=payload, action=action, review_id=review_id, result=result)
+    if event is None:
+        return "invalid"
+    try:
+        return sink.record(event)
+    except Exception:
+        return "sink_error"
 
 
 def _safe_route_path(value: Any) -> str:
@@ -430,6 +612,8 @@ async def handle_discord_interaction_request(
     verifier: Callable[..., bool] | None = None,
     dry_run_handler: Callable[[dict[str, Any]], Any] | None = None,
     replay_cache: DiscordInteractionReplayCache | None = None,
+    feedback_sink: DiscordInteractionFeedbackSink | None = None,
+    feedback_idempotency_keys: set[str] | None = None,
     engine: DiscordInteractionEngine | None = None,
     now: Callable[[], float] | float | None = None,
 ):
@@ -498,4 +682,9 @@ async def handle_discord_interaction_request(
     ack = engine_result.ack
     if ack is None:
         return _error_response("unsupported_interaction", 400)
+    record_discord_feedback_event(
+        sink=feedback_sink,
+        idempotency_keys=feedback_idempotency_keys,
+        payload=payload,
+    )
     return _aiohttp_web().json_response(ack)

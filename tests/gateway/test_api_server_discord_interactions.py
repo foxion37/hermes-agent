@@ -27,12 +27,15 @@ from gateway.discord_interactions import (
     DISCORD_INTERACTION_ROUTE,
     DiscordInteractionConfig,
     DiscordInteractionEngineResult,
+    DiscordInteractionFeedbackEvent,
+    DiscordInteractionJsonlFeedbackSink,
     DiscordInteractionReplayCache,
     DiscordInteractionRunnerResult,
     build_discord_interaction_engine,
     default_discord_signature_verifier,
     resolve_discord_interaction_config,
     validate_discord_dry_run_result,
+    validate_discord_feedback_event,
     validate_discord_interaction_timestamp,
 )
 
@@ -365,6 +368,224 @@ async def test_non_component_payload_with_custom_id_does_not_call_preview_runner
         assert data["error"] == "unsupported_interaction"
 
     assert runner.called is False
+
+
+@pytest.mark.asyncio
+async def test_component_interaction_records_one_append_only_feedback_event():
+    class MemorySink:
+        def __init__(self):
+            self.events = []
+
+        def record(self, event):
+            self.events.append(event)
+            return "recorded"
+
+    sink = MemorySink()
+    adapter = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key"}})
+    adapter._discord_interaction_verifier = lambda **_kwargs: True
+    adapter._discord_interaction_feedback_sink = sink
+    app = web.Application()
+    adapter._register_discord_interaction_route(app)
+
+    payload = {
+        "type": 3,
+        "id": "interaction-feedback-1",
+        "data": {"custom_id": "mim:soma-review:v1:approve:review-123"},
+    }
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "sig-feedback-1",
+                "X-Signature-Timestamp": _fresh_timestamp(),
+            },
+        )
+        data = await resp.json()
+
+    assert resp.status == 200
+    assert data["type"] == 4
+    assert len(sink.events) == 1
+    event = sink.events[0]
+    assert event.kind == "discord_interaction_feedback"
+    assert event.interaction_id == "interaction-feedback-1"
+    assert event.action == "approve"
+    assert event.review_id == "review-123"
+    assert event.source == "discord_interaction_livegate"
+    assert event.endpoint_version == "soma-v1"
+    assert event.result == "preview_ack"
+    assert event.idempotency_key == "interaction-feedback-1:approve:review-123"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_interaction_id_records_duplicate_once_without_runtime_db():
+    class MemorySink:
+        def __init__(self):
+            self.events = []
+
+        def record(self, event):
+            self.events.append(event)
+            return "recorded"
+
+    sink = MemorySink()
+    adapter = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key"}})
+    adapter._discord_interaction_verifier = lambda **_kwargs: True
+    adapter._discord_interaction_feedback_sink = sink
+    app = web.Application()
+    adapter._register_discord_interaction_route(app)
+
+    payload = {
+        "type": 3,
+        "id": "interaction-feedback-dup",
+        "data": {"custom_id": "mim:soma-review:v1:reject:review-dup"},
+    }
+    async with TestClient(TestServer(app)) as cli:
+        first = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "sig-feedback-dup-1",
+                "X-Signature-Timestamp": _fresh_timestamp(),
+            },
+        )
+        second = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "sig-feedback-dup-2",
+                "X-Signature-Timestamp": _fresh_timestamp(),
+            },
+        )
+        first_data = await first.json()
+        second_data = await second.json()
+
+    assert first.status == 200
+    assert second.status == 200
+    assert first_data["type"] == 4
+    assert second_data["type"] == 4
+    assert [event.result for event in sink.events] == ["preview_ack", "duplicate"]
+    assert sink.events[0].idempotency_key == sink.events[1].idempotency_key
+
+
+@pytest.mark.asyncio
+async def test_invalid_signature_timestamp_replay_and_non_component_do_not_record_feedback():
+    class MemorySink:
+        def __init__(self):
+            self.events = []
+
+        def record(self, event):
+            self.events.append(event)
+            return "recorded"
+
+    sink = MemorySink()
+    adapter = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key"}})
+    adapter._discord_interaction_verifier = lambda **_kwargs: False
+    adapter._discord_interaction_feedback_sink = sink
+    app = web.Application()
+    adapter._register_discord_interaction_route(app)
+
+    async with TestClient(TestServer(app)) as cli:
+        bad_sig = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=b'{"type":3,"id":"interaction-bad","data":{"custom_id":"mim:soma-review:v1:approve:review-1"}}',
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "bad-sig",
+                "X-Signature-Timestamp": _fresh_timestamp(),
+            },
+        )
+        bad_time = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=b'{"type":3,"id":"interaction-time","data":{"custom_id":"mim:soma-review:v1:approve:review-1"}}',
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "sig-time",
+                "X-Signature-Timestamp": "+123",
+            },
+        )
+
+    assert bad_sig.status == 401
+    assert bad_time.status == 401
+    assert sink.events == []
+
+    adapter2 = _adapter({"discord_interactions": {"enabled": True, "public_key": "public-key"}})
+    adapter2._discord_interaction_verifier = lambda **_kwargs: True
+    adapter2._discord_interaction_feedback_sink = sink
+    app2 = web.Application()
+    adapter2._register_discord_interaction_route(app2)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Signature-Ed25519": "sig-replay-no-event",
+        "X-Signature-Timestamp": _fresh_timestamp(),
+    }
+    body = b'{"type":3,"id":"interaction-replay-no-event","data":{"custom_id":"mim:soma-review:v1:approve:review-1"}}'
+    async with TestClient(TestServer(app2)) as cli:
+        first = await cli.post(DISCORD_INTERACTION_ROUTE, data=body, headers=headers)
+        second = await cli.post(DISCORD_INTERACTION_ROUTE, data=body, headers=headers)
+        non_component = await cli.post(
+            DISCORD_INTERACTION_ROUTE,
+            data=b'{"type":2,"id":"interaction-non-component","data":{"custom_id":"mim:soma-review:v1:approve:review-1"}}',
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-Ed25519": "sig-non-component",
+                "X-Signature-Timestamp": _fresh_timestamp(),
+            },
+        )
+
+    assert first.status == 200
+    assert second.status == 409
+    assert non_component.status == 400
+    assert [event.interaction_id for event in sink.events] == ["interaction-replay-no-event"]
+
+
+def test_feedback_event_validation_refuses_raw_headers_signatures_tokens():
+    event = DiscordInteractionFeedbackEvent(
+        event_id="safe",
+        idempotency_key="interaction:approve:review-1",
+        timestamp="2026-05-09T00:00:00Z",
+        interaction_id="interaction",
+        action="approve",
+        review_id="review-1",
+        source="discord_interaction_livegate",
+        endpoint_version="soma-v1",
+        result="preview_ack",
+    )
+    assert validate_discord_feedback_event(event) == (True, "ok")
+
+    unsafe_events = [
+        event.__class__(**{**event.__dict__, "signature": "abc"}),
+        event.__class__(**{**event.__dict__, "headers": {"X-Signature-Ed25519": "abc"}}),
+        event.__class__(**{**event.__dict__, "review_id": "DISCORD_BOT_TOKEN"}),
+    ]
+    for unsafe in unsafe_events:
+        assert validate_discord_feedback_event(unsafe)[0] is False
+
+
+def test_jsonl_feedback_sink_is_append_only_and_idempotent(tmp_path):
+    path = tmp_path / "feedback.jsonl"
+    sink = DiscordInteractionJsonlFeedbackSink(path)
+    event = DiscordInteractionFeedbackEvent(
+        event_id="event-1",
+        idempotency_key="interaction:approve:review-1",
+        timestamp="2026-05-09T00:00:00Z",
+        interaction_id="interaction",
+        action="approve",
+        review_id="review-1",
+        source="discord_interaction_livegate",
+        endpoint_version="soma-v1",
+        result="preview_ack",
+    )
+
+    assert sink.record(event) == "recorded"
+    assert sink.record(event.__class__(**{**event.__dict__, "event_id": "event-2", "result": "duplicate"})) == "duplicate"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(rows) == 2
+    assert rows[0]["result"] == "preview_ack"
+    assert rows[1]["result"] == "duplicate"
+    assert all("signature" not in row and "headers" not in row for row in rows)
 
 
 @pytest.mark.asyncio

@@ -35,6 +35,7 @@ import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -46,6 +47,7 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.discord_interactions import (
+    DiscordInteractionJsonlFeedbackSink,
     DiscordInteractionReplayCache,
     build_discord_interaction_engine,
     default_discord_signature_verifier,
@@ -622,6 +624,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._discord_interaction_verifier = default_discord_signature_verifier
         self._discord_interaction_dry_run_handler = None
         self._discord_interaction_replay_cache = DiscordInteractionReplayCache()
+        self._discord_interaction_feedback_sink = self._build_discord_interaction_feedback_sink(extra)
+        self._discord_interaction_feedback_idempotency_keys: set[str] = set()
         self._discord_interaction_engine = build_discord_interaction_engine(
             self._discord_interaction_config.engine_name
         )
@@ -804,6 +808,33 @@ class APIServerAdapter(BasePlatformAdapter):
     # Discord interaction local gate
     # ------------------------------------------------------------------
 
+    def _build_discord_interaction_feedback_sink(self, extra: dict[str, Any]) -> Any:
+        """Build an optional append-only local artifact sink.
+
+        This deliberately writes JSONL files only when configured. It never
+        opens a runtime DB and never captures raw headers/signatures.
+        """
+
+        section = (extra or {}).get("discord_interactions") or {}
+        if not isinstance(section, dict):
+            return None
+        feedback = section.get("feedback_events") or {}
+        if feedback is False:
+            return None
+        if not isinstance(feedback, dict):
+            feedback = {}
+        enabled = feedback.get("enabled") is True or bool(feedback.get("path")) or bool(section.get("feedback_path"))
+        if not enabled:
+            return None
+        raw_path = feedback.get("path") or section.get("feedback_path")
+        if raw_path:
+            path = Path(str(raw_path)).expanduser()
+        else:
+            from hermes_constants import get_hermes_home
+
+            path = get_hermes_home() / "discord-interactions" / "feedback.jsonl"
+        return DiscordInteractionJsonlFeedbackSink(path)
+
     def _register_discord_interaction_route(self, app: "web.Application") -> bool:
         """Mount the Discord interaction route only when explicitly enabled.
 
@@ -823,6 +854,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 verifier=self._discord_interaction_verifier,
                 dry_run_handler=self._discord_interaction_dry_run_handler,
                 replay_cache=self._discord_interaction_replay_cache,
+                feedback_sink=self._discord_interaction_feedback_sink,
+                feedback_idempotency_keys=self._discord_interaction_feedback_idempotency_keys,
                 engine=self._discord_interaction_engine,
             )
 
