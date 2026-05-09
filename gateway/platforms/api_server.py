@@ -48,6 +48,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.discord_interactions import (
     DiscordInteractionJsonlFeedbackSink,
+    DiscordInteractionJsonlWorkQueueSink,
     DiscordInteractionReplayCache,
     build_discord_interaction_engine,
     default_discord_signature_verifier,
@@ -626,6 +627,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._discord_interaction_replay_cache = DiscordInteractionReplayCache()
         self._discord_interaction_feedback_sink = self._build_discord_interaction_feedback_sink(extra)
         self._discord_interaction_feedback_idempotency_keys: set[str] = set()
+        self._discord_interaction_work_queue_sink = self._build_discord_interaction_work_queue_sink(extra)
+        self._discord_interaction_work_queue_idempotency_keys: set[str] = set()
         self._discord_interaction_engine = build_discord_interaction_engine(
             self._discord_interaction_config.engine_name
         )
@@ -835,6 +838,29 @@ class APIServerAdapter(BasePlatformAdapter):
             path = get_hermes_home() / "discord-interactions" / "feedback.jsonl"
         return DiscordInteractionJsonlFeedbackSink(path)
 
+    def _build_discord_interaction_work_queue_sink(self, extra: dict[str, Any]) -> Any:
+        """Build an optional append-only queue artifact for later workers."""
+
+        section = (extra or {}).get("discord_interactions") or {}
+        if not isinstance(section, dict):
+            return None
+        queue = section.get("work_queue") or {}
+        if queue is False:
+            return None
+        if not isinstance(queue, dict):
+            queue = {}
+        enabled = queue.get("enabled") is True or bool(queue.get("path")) or bool(section.get("work_queue_path"))
+        if not enabled:
+            return None
+        raw_path = queue.get("path") or section.get("work_queue_path")
+        if raw_path:
+            path = Path(str(raw_path)).expanduser()
+        else:
+            from hermes_constants import get_hermes_home
+
+            path = get_hermes_home() / "discord-interactions" / "work-queue.jsonl"
+        return DiscordInteractionJsonlWorkQueueSink(path)
+
     def _register_discord_interaction_route(self, app: "web.Application") -> bool:
         """Mount the Discord interaction route only when explicitly enabled.
 
@@ -856,6 +882,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 replay_cache=self._discord_interaction_replay_cache,
                 feedback_sink=self._discord_interaction_feedback_sink,
                 feedback_idempotency_keys=self._discord_interaction_feedback_idempotency_keys,
+                work_queue_sink=self._discord_interaction_work_queue_sink,
+                work_queue_idempotency_keys=self._discord_interaction_work_queue_idempotency_keys,
                 engine=self._discord_interaction_engine,
             )
 
