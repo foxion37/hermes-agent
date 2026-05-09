@@ -17,7 +17,7 @@ import re
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Protocol, cast
 
@@ -194,6 +194,21 @@ class DiscordInteractionJsonlWorkQueueSink:
 
 
 @dataclass(frozen=True)
+class DiscordInteractionWorkQueueCandidate:
+    """Read-only candidate preview derived from queued button signals."""
+
+    review_label: str
+    action_counts: dict[str, int] = field(default_factory=dict)
+    queued: int = 0
+    duplicates: int = 0
+    state_preview: str = "needs_review"
+    weight_preview: int = 0
+    apply_candidate: str = "review_needed"
+    warnings: tuple[str, ...] = ()
+    latest_timestamp: str | None = None
+
+
+@dataclass(frozen=True)
 class DiscordInteractionWorkQueueSummary:
     """Read-only aggregate view of the local interaction work queue."""
 
@@ -207,6 +222,7 @@ class DiscordInteractionWorkQueueSummary:
     action_counts: dict[str, int] = field(default_factory=dict)
     review_counts: dict[str, int] = field(default_factory=dict)
     latest_timestamp: str | None = None
+    candidates: list[DiscordInteractionWorkQueueCandidate] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -624,6 +640,7 @@ def inspect_discord_work_queue(path: Path | str) -> DiscordInteractionWorkQueueS
     action_counts = Counter(item.action for item in valid_items)
     review_counts = Counter(_redacted_label("review", item.review_id) for item in valid_items)
     latest = max((item.timestamp for item in valid_items), default=None)
+    candidates = _work_queue_candidates(valid_items)
     return DiscordInteractionWorkQueueSummary(
         path=str(queue_path),
         exists=True,
@@ -635,6 +652,7 @@ def inspect_discord_work_queue(path: Path | str) -> DiscordInteractionWorkQueueS
         action_counts=dict(action_counts),
         review_counts=dict(review_counts),
         latest_timestamp=latest,
+        candidates=candidates,
     )
 
 
@@ -649,7 +667,73 @@ def _redacted_label(prefix: str, value: str) -> str:
     return f"{prefix}#{digest}"
 
 
-def render_discord_work_queue_digest_ko(summary: DiscordInteractionWorkQueueSummary) -> str:
+def _parse_queue_timestamp(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _has_duplicate_burst(items: list[DiscordInteractionWorkItem], *, threshold: int = 5, minutes: int = 30) -> bool:
+    duplicate_times = sorted(
+        parsed
+        for item in items
+        if item.status == "duplicate" and (parsed := _parse_queue_timestamp(item.timestamp)) is not None
+    )
+    if len(duplicate_times) < threshold:
+        return False
+    window = timedelta(minutes=minutes)
+    for idx, start in enumerate(duplicate_times):
+        end_idx = idx + threshold - 1
+        if end_idx < len(duplicate_times) and duplicate_times[end_idx] - start <= window:
+            return True
+    return False
+
+
+def _state_preview(action_counts: Counter[str]) -> str:
+    if len(action_counts) != 1:
+        return "mixed"
+    action = next(iter(action_counts))
+    return {"approve": "accepted", "reject": "rejected", "defer": "needs_review"}.get(action, "needs_review")
+
+
+def _work_queue_candidates(items: list[DiscordInteractionWorkItem]) -> list[DiscordInteractionWorkQueueCandidate]:
+    by_review: dict[str, list[DiscordInteractionWorkItem]] = {}
+    for item in items:
+        by_review.setdefault(item.review_id, []).append(item)
+
+    candidates: list[DiscordInteractionWorkQueueCandidate] = []
+    for review_id in sorted(by_review):
+        group = by_review[review_id]
+        action_counts = Counter(item.action for item in group)
+        state = _state_preview(action_counts)
+        weight = action_counts.get("approve", 0) - action_counts.get("reject", 0)
+        warnings: list[str] = []
+        if len(action_counts) > 1:
+            warnings.append("conflicting_actions")
+        if _has_duplicate_burst(group):
+            warnings.append("excessive_duplicates")
+        apply_candidate = "review_needed" if warnings else state
+        candidates.append(
+            DiscordInteractionWorkQueueCandidate(
+                review_label=_redacted_label("review", review_id),
+                action_counts=dict(action_counts),
+                queued=sum(1 for item in group if item.status == "queued"),
+                duplicates=sum(1 for item in group if item.status == "duplicate"),
+                state_preview=state,
+                weight_preview=weight,
+                apply_candidate=apply_candidate,
+                warnings=tuple(warnings),
+                latest_timestamp=max((item.timestamp for item in group), default=None),
+            )
+        )
+    return candidates
+
+
+def render_discord_work_queue_digest_ko(summary: DiscordInteractionWorkQueueSummary, *, verbose: bool = False) -> str:
     """Render a Korean read-only digest without raw JSON/log exposure."""
 
     if not summary.exists or summary.valid_items == 0:
@@ -663,20 +747,32 @@ def render_discord_work_queue_digest_ko(summary: DiscordInteractionWorkQueueSumm
                 "- agent 실행 없음.",
             ]
         )
-    return "\n".join(
-        [
-            "Discord 버튼 queue 요약",
-            f"- 총 유효 항목: {summary.valid_items}",
-            f"- 대기: {summary.queued}",
-            f"- 중복: {summary.duplicates}",
-            f"- action: {_format_counts(summary.action_counts)}",
-            f"- review: {_format_counts(summary.review_counts)}",
-            f"- 최신 시각: {summary.latest_timestamp or '없음'}",
-            f"- 무효/스킵 행: {summary.invalid_rows}",
-            "- 실제 적용은 아직 하지 않았습니다.",
-            "- DB write 없음. live send 없음. agent 실행 없음.",
-        ]
-    )
+    lines = [
+        "Discord 버튼 queue 요약",
+        f"- 총 유효 항목: {summary.valid_items}",
+        f"- 대기: {summary.queued}",
+        f"- 중복: {summary.duplicates}",
+        f"- action: {_format_counts(summary.action_counts)}",
+        f"- review: {_format_counts(summary.review_counts)}",
+        f"- 최신 시각: {summary.latest_timestamp or '없음'}",
+        f"- 무효/스킵 행: {summary.invalid_rows}",
+        "- 실제 적용은 아직 하지 않았습니다.",
+        "- DB write 없음. live send 없음. agent 실행 없음.",
+    ]
+    if verbose and summary.candidates:
+        lines.append("후보 preview")
+        for candidate in summary.candidates:
+            warnings = ",".join(candidate.warnings) if candidate.warnings else "없음"
+            lines.append(
+                "- "
+                f"{candidate.review_label}: "
+                f"actions={_format_counts(candidate.action_counts)}, "
+                f"state_preview={candidate.state_preview}, "
+                f"weight_preview={candidate.weight_preview}, "
+                f"apply_candidate={candidate.apply_candidate}, "
+                f"warnings={warnings}"
+            )
+    return "\n".join(lines)
 
 
 def _safe_route_path(value: Any) -> str:

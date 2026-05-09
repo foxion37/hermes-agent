@@ -30,9 +30,14 @@ def main(argv: list[str] | None = None) -> int:
         default=str(DEFAULT_QUEUE_PATH),
         help="work-queue JSONL path; default: ~/.hermes/discord-interactions/work-queue.jsonl",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show per-review read-only candidate preview rows",
+    )
     args = parser.parse_args(argv)
     summary = inspect_discord_work_queue(Path(args.path).expanduser())
-    print(render_discord_work_queue_digest_ko(summary))
+    print(render_discord_work_queue_digest_ko(summary, verbose=args.verbose))
     return 0
 
 

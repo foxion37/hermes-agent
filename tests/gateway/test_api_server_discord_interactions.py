@@ -36,6 +36,7 @@ from gateway.discord_interactions import (
     DiscordInteractionReplayCache,
     DiscordInteractionRunnerResult,
     DiscordInteractionWorkItem,
+    DiscordInteractionWorkQueueCandidate,
     DiscordInteractionWorkQueueSummary,
     build_discord_interaction_engine,
     default_discord_signature_verifier,
@@ -401,11 +402,19 @@ def test_queue_inspector_script_prints_read_only_korean_digest(tmp_path):
     )
     script = Path(__file__).resolve().parents[2] / "scripts" / "discord_interaction_queue_inspect.py"
 
-    result = subprocess.run([sys.executable, str(script), str(path)], capture_output=True, text=True, check=True)
+    result = subprocess.run(
+        [sys.executable, str(script), "--verbose", str(path)], capture_output=True, text=True, check=True
+    )
 
     assert "Discord 버튼 queue 요약" in result.stdout
     assert "총 유효 항목: 1" in result.stdout
     assert "approve: 1" in result.stdout
+    assert "후보 preview" in result.stdout
+    assert "apply_candidate=accepted" in result.stdout
+    assert "interaction-script" not in result.stdout
+    assert "work-script" not in result.stdout
+    assert "interaction-script:approve:review-script" not in result.stdout
+    assert "review-script" not in result.stdout
     assert "DB write 없음" in result.stdout
 
 
@@ -466,7 +475,156 @@ def test_work_queue_inspector_summarizes_fixture_without_applying(tmp_path):
         action_counts={"approve": 2, "reject": 1},
         review_counts={"review#0c263c7e": 2, "review#7b6f1114": 1},
         latest_timestamp="2026-05-09T00:02:00Z",
+        candidates=[
+            DiscordInteractionWorkQueueCandidate(
+                review_label="review#0c263c7e",
+                action_counts={"approve": 2},
+                queued=1,
+                duplicates=1,
+                state_preview="accepted",
+                weight_preview=2,
+                apply_candidate="accepted",
+                latest_timestamp="2026-05-09T00:02:00Z",
+            ),
+            DiscordInteractionWorkQueueCandidate(
+                review_label="review#7b6f1114",
+                action_counts={"reject": 1},
+                queued=1,
+                duplicates=0,
+                state_preview="rejected",
+                weight_preview=-1,
+                apply_candidate="rejected",
+                latest_timestamp="2026-05-09T00:01:00Z",
+            ),
+        ],
     )
+
+
+def test_work_queue_policy_preview_is_read_only_and_flags_conflicts_and_duplicate_bursts(tmp_path):
+    path = tmp_path / "work-queue.jsonl"
+    rows = [
+        {
+            "kind": "discord_interaction_work_item",
+            "work_id": "work-approve",
+            "idempotency_key": "interaction-approve:approve:review-conflict",
+            "timestamp": "2026-05-09T00:00:00Z",
+            "interaction_id": "interaction-approve",
+            "action": "approve",
+            "review_id": "review-conflict",
+            "source": "discord_interaction_livegate",
+            "endpoint_version": "soma-v1",
+            "status": "queued",
+        },
+        {
+            "kind": "discord_interaction_work_item",
+            "work_id": "work-reject",
+            "idempotency_key": "interaction-reject:reject:review-conflict",
+            "timestamp": "2026-05-09T00:01:00Z",
+            "interaction_id": "interaction-reject",
+            "action": "reject",
+            "review_id": "review-conflict",
+            "source": "discord_interaction_livegate",
+            "endpoint_version": "soma-v1",
+            "status": "queued",
+        },
+    ]
+    for idx in range(5):
+        rows.append(
+            {
+                "kind": "discord_interaction_work_item",
+                "work_id": f"work-duplicate-{idx}",
+                "idempotency_key": "interaction-dup:approve:review-noisy",
+                "timestamp": f"2026-05-09T00:0{idx}:00Z",
+                "interaction_id": "interaction-dup",
+                "action": "approve",
+                "review_id": "review-noisy",
+                "source": "discord_interaction_livegate",
+                "endpoint_version": "soma-v1",
+                "status": "duplicate",
+            }
+        )
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    summary = inspect_discord_work_queue(path)
+
+    assert summary.candidates == [
+        DiscordInteractionWorkQueueCandidate(
+            review_label="review#e0b25135",
+            action_counts={"approve": 1, "reject": 1},
+            queued=2,
+            duplicates=0,
+            state_preview="mixed",
+            weight_preview=0,
+            apply_candidate="review_needed",
+            warnings=("conflicting_actions",),
+            latest_timestamp="2026-05-09T00:01:00Z",
+        ),
+        DiscordInteractionWorkQueueCandidate(
+            review_label="review#fc6e9418",
+            action_counts={"approve": 5},
+            queued=0,
+            duplicates=5,
+            state_preview="accepted",
+            weight_preview=5,
+            apply_candidate="review_needed",
+            warnings=("excessive_duplicates",),
+            latest_timestamp="2026-05-09T00:04:00Z",
+        ),
+    ]
+
+    compact = render_discord_work_queue_digest_ko(summary)
+    verbose = render_discord_work_queue_digest_ko(summary, verbose=True)
+
+    assert "후보 preview" not in compact
+    assert "후보 preview" in verbose
+    assert "review#e0b25135" in verbose
+    assert "conflicting_actions" in verbose
+    assert "excessive_duplicates" in verbose
+    assert "review-conflict" not in verbose
+    assert "review-noisy" not in verbose
+    assert "interaction-approve" not in compact
+    assert "interaction-approve" not in verbose
+    assert "work-approve" not in verbose
+    assert "interaction-approve:approve:review-conflict" not in verbose
+
+
+def test_work_queue_duplicate_burst_threshold_boundaries_are_read_only(tmp_path):
+    def row(idx: int, timestamp: str, review_id: str) -> dict[str, str]:
+        return {
+            "kind": "discord_interaction_work_item",
+            "work_id": f"work-{review_id}-{idx}",
+            "idempotency_key": f"interaction-{review_id}:approve:{review_id}",
+            "timestamp": timestamp,
+            "interaction_id": f"interaction-{review_id}",
+            "action": "approve",
+            "review_id": review_id,
+            "source": "discord_interaction_livegate",
+            "endpoint_version": "soma-v1",
+            "status": "duplicate",
+        }
+
+    path = tmp_path / "work-queue.jsonl"
+    rows = [
+        *(row(idx, f"2026-05-09T00:0{idx}:00Z", "review-four") for idx in range(4)),
+        *(row(idx, f"2026-05-09T01:{idx * 10:02d}:00Z", "review-spread") for idx in range(5)),
+        *(row(idx, f"2026-05-09T02:0{idx}:00Z", "review-burst") for idx in range(5)),
+    ]
+    path.write_text("\n".join(json.dumps(item) for item in rows) + "\n", encoding="utf-8")
+
+    by_label = {candidate.review_label: candidate for candidate in inspect_discord_work_queue(path).candidates}
+
+    four = by_label["review#e4e5dc0f"]
+    spread = by_label["review#4ce814d5"]
+    burst = by_label["review#225f1e4f"]
+    assert four.duplicates == 4
+    assert "excessive_duplicates" not in four.warnings
+    assert four.apply_candidate == "accepted"
+    assert spread.duplicates == 5
+    assert "excessive_duplicates" not in spread.warnings
+    assert spread.apply_candidate == "accepted"
+    assert burst.duplicates == 5
+    assert "excessive_duplicates" in burst.warnings
+    assert burst.apply_candidate == "review_needed"
 
 
 def test_work_queue_digest_is_korean_read_only_and_progressive(tmp_path):
