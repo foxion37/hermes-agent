@@ -39,14 +39,16 @@ from gateway.discord_interactions import (
     DiscordInteractionWorkQueueCandidate,
     DiscordInteractionWorkQueueSummary,
     build_discord_ack_preview,
+    build_discord_decision_card_payload,
     build_discord_interaction_engine,
+    filter_discord_work_queue_for_operations,
+    inspect_discord_work_queue,
     default_discord_signature_verifier,
     resolve_discord_interaction_config,
     validate_discord_dry_run_result,
     validate_discord_feedback_event,
     validate_discord_interaction_timestamp,
     validate_discord_work_item,
-    inspect_discord_work_queue,
     render_discord_work_queue_digest_ko,
 )
 from scripts.discord_interaction_decision_note import (
@@ -191,7 +193,7 @@ def test_button_ack_updates_message_with_disabled_components_and_friendly_korean
                         },
                         {
                             "type": 2,
-                            "style": 2,
+                            "style": 5,
                             "label": "보류 🕊️",
                             "custom_id": "mim:soma-review:v1:defer:review-disable",
                         },
@@ -212,9 +214,175 @@ def test_button_ack_updates_message_with_disabled_components_and_friendly_korean
     assert "DB write 없음" in data["content"]
     assert data["components"][0]["components"][0]["disabled"] is True
     assert data["components"][0]["components"][1]["disabled"] is True
+    assert data["components"][0]["components"][1]["style"] == 2
     assert data["components"][0]["components"][0]["label"].startswith("✅ 선택됨")
     assert "review-disable" not in data["content"]
     assert "token" not in data["content"].lower()
+
+
+def test_q_decision_v1_custom_id_is_primary_and_mim_v1_remains_compatible():
+    payload = {
+        "type": 3,
+        "id": "interaction-q-decision",
+        "message": {
+            "components": [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 2,
+                            "style": 3,
+                            "label": "좋아요 ✅",
+                            "custom_id": "q-decision:v1:approve:ops-review-1",
+                        },
+                        {
+                            "type": 2,
+                            "style": 4,
+                            "label": "거부 🛑",
+                            "custom_id": "q-decision:v1:reject:ops-review-1",
+                        },
+                    ],
+                }
+            ]
+        },
+        "data": {"custom_id": "q-decision:v1:approve:ops-review-1"},
+    }
+
+    ack = build_discord_ack_preview(payload)
+    legacy = build_discord_ack_preview({"type": 3, "id": "interaction-legacy", "data": {"custom_id": "mim:soma-review:v1:defer:legacy-review"}})
+
+    assert ack is not None
+    assert ack["type"] == 7
+    assert "✅ 승인으로 기록했어요" in ack["data"]["content"]
+    assert "ops-review-1" not in ack["data"]["content"]
+    assert ack["data"]["components"][0]["components"][0]["disabled"] is True
+    assert legacy is not None
+    assert legacy["type"] == 4
+
+
+def test_q_decision_v1_route_records_q_endpoint_version_in_queue_and_feedback():
+    feedback = discord_interactions_module.build_discord_feedback_event(
+        payload={"type": 3, "id": "interaction-q-row", "data": {"custom_id": "q-decision:v1:approve:ops-review-row"}},
+        action="approve",
+        review_id="ops-review-row",
+        result="preview_ack",
+    )
+    work = discord_interactions_module.build_discord_work_item(
+        payload={"type": 3, "id": "interaction-q-row", "data": {"custom_id": "q-decision:v1:approve:ops-review-row"}},
+        action="approve",
+        review_id="ops-review-row",
+        status="queued",
+    )
+
+    assert feedback is not None
+    assert feedback.endpoint_version == "q-decision-v1"
+    assert work is not None
+    assert work.endpoint_version == "q-decision-v1"
+
+
+def test_decision_card_payload_helper_uses_q_decision_v1_and_safe_korean_copy():
+    card = build_discord_decision_card_payload(
+        title="시스템 도구 점검 승인",
+        summary="brew 업데이트 후보를 검토합니다.",
+        review_id="ops-review-42",
+    )
+
+    assert card["content"].startswith("🌈 시스템 도구 점검 승인")
+    assert "brew 업데이트 후보" in card["content"]
+    assert "raw JSON" not in card["content"]
+    buttons = card["components"][0]["components"]
+    assert [button["custom_id"] for button in buttons] == [
+        "q-decision:v1:approve:ops-review-42",
+        "q-decision:v1:defer:ops-review-42",
+        "q-decision:v1:reject:ops-review-42",
+    ]
+    assert [button["label"] for button in buttons] == ["승인 ✅", "보류 🕊️", "거부 🛑"]
+
+    unsafe = build_discord_decision_card_payload(title="x", summary="y", review_id="bad#review")
+    unsafe_id = unsafe["components"][0]["components"][0]["custom_id"]
+    assert unsafe_id.startswith("q-decision:v1:approve:review-")
+    assert "#" not in unsafe_id
+    assert build_discord_ack_preview({"type": 3, "id": "interaction-safe-fallback", "data": {"custom_id": unsafe_id}}) is not None
+
+
+def test_operations_filter_is_read_only_and_marks_expired_or_conflicted_items(tmp_path):
+    queue = tmp_path / "work-queue.jsonl"
+    rows = [
+        {
+            "kind": "discord_interaction_work_item",
+            "work_id": "work-approve",
+            "idempotency_key": "interaction-approve:approve:review-approved",
+            "timestamp": "2026-05-10T00:00:00Z",
+            "interaction_id": "interaction-approve",
+            "action": "approve",
+            "review_id": "review-approved",
+            "source": "discord_interaction_livegate",
+            "endpoint_version": "q-decision-v1",
+            "status": "queued",
+        },
+        {
+            "kind": "discord_interaction_work_item",
+            "work_id": "work-old",
+            "idempotency_key": "interaction-old:approve:review-old",
+            "timestamp": "2026-05-01T00:00:00Z",
+            "interaction_id": "interaction-old",
+            "action": "approve",
+            "review_id": "review-old",
+            "source": "discord_interaction_livegate",
+            "endpoint_version": "q-decision-v1",
+            "status": "queued",
+        },
+        {
+            "kind": "discord_interaction_work_item",
+            "work_id": "work-conflict-a",
+            "idempotency_key": "interaction-conflict-a:approve:review-conflict",
+            "timestamp": "2026-05-10T00:01:00Z",
+            "interaction_id": "interaction-conflict-a",
+            "action": "approve",
+            "review_id": "review-conflict",
+            "source": "discord_interaction_livegate",
+            "endpoint_version": "q-decision-v1",
+            "status": "queued",
+        },
+        {
+            "kind": "discord_interaction_work_item",
+            "work_id": "work-conflict-b",
+            "idempotency_key": "interaction-conflict-b:reject:review-conflict",
+            "timestamp": "2026-05-10T00:02:00Z",
+            "interaction_id": "interaction-conflict-b",
+            "action": "reject",
+            "review_id": "review-conflict",
+            "source": "discord_interaction_livegate",
+            "endpoint_version": "q-decision-v1",
+            "status": "queued",
+        },
+        {
+            "kind": "discord_interaction_work_item",
+            "work_id": "work-duplicate-only",
+            "idempotency_key": "interaction-duplicate-only:approve:review-duplicate-only",
+            "timestamp": "2026-05-10T00:03:00Z",
+            "interaction_id": "interaction-duplicate-only",
+            "action": "approve",
+            "review_id": "review-duplicate-only",
+            "source": "discord_interaction_livegate",
+            "endpoint_version": "q-decision-v1",
+            "status": "duplicate",
+        },
+    ]
+    queue.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    operations = filter_discord_work_queue_for_operations(queue, now="2026-05-10T12:00:00Z", max_age_hours=72)
+
+    assert [item.review_label for item in operations.accepted] == ["review#579d6e79"]
+    assert operations.expired == 1
+    assert operations.conflicted == 1
+    assert operations.review_needed == 1
+    assert operations.runtime_write is False
+    assert operations.live_send is False
+    assert operations.shell is False
+    assert operations.env_lookup is False
+    assert "review-approved" not in operations.digest
+    assert "실제 적용은 아직 하지 않았습니다" in operations.digest
 
 
 def test_preview_runner_result_rejects_side_effect_or_secret_shaped_output():
@@ -646,6 +814,42 @@ def test_queue_inspector_script_prints_read_only_korean_digest(tmp_path):
     assert "work-script" not in result.stdout
     assert "interaction-script:approve:review-script" not in result.stdout
     assert "review-script" not in result.stdout
+    assert "DB write 없음" in result.stdout
+
+
+def test_queue_inspector_script_can_render_operations_preview_without_applying(tmp_path):
+    path = tmp_path / "work-queue.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "kind": "discord_interaction_work_item",
+                "work_id": "work-script-ops",
+                "idempotency_key": "interaction-script-ops:approve:review-script-ops",
+                "timestamp": "2026-05-10T00:00:00Z",
+                "interaction_id": "interaction-script-ops",
+                "action": "approve",
+                "review_id": "review-script-ops",
+                "source": "discord_interaction_livegate",
+                "endpoint_version": "q-decision-v1",
+                "status": "queued",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    script = Path(__file__).resolve().parents[2] / "scripts" / "discord_interaction_queue_inspect.py"
+
+    result = subprocess.run(
+        [sys.executable, str(script), "--operations", "--now", "2026-05-10T01:00:00Z", str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert "🌈 Discord livegate 운영 preview" in result.stdout
+    assert "승인 후보: 1" in result.stdout
+    assert "실제 적용은 아직 하지 않았습니다" in result.stdout
+    assert "review-script-ops" not in result.stdout
     assert "DB write 없음" in result.stdout
 
 

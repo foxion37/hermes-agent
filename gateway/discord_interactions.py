@@ -42,7 +42,9 @@ _BLOCKED_PUBLIC_KEY_ENV_MARKERS = (
     "AUTHORIZATION",
     "BEARER",
 )
-_CUSTOM_ID_RE = re.compile(r"^mim:soma-review:v1:(approve|reject|defer):([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})$")
+_CUSTOM_ID_RE = re.compile(
+    r"^(?:q-decision:v1|mim:soma-review:v1):(approve|reject|defer):([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})$"
+)
 _SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _ASCII_DECIMAL_RE = re.compile(r"^[0-9]{1,20}$")
 _ALLOWED_ENGINE_NAMES = {"preview", "mim-preview", "mim_preview"}
@@ -50,6 +52,7 @@ _RUNNER_CONTENT_MAX_LENGTH = 512
 _FEEDBACK_KIND = "discord_interaction_feedback"
 _FEEDBACK_SOURCE = "discord_interaction_livegate"
 _FEEDBACK_ENDPOINT_VERSION = "soma-v1"
+_ALLOWED_ENDPOINT_VERSIONS = {_FEEDBACK_ENDPOINT_VERSION, "q-decision-v1"}
 _FEEDBACK_RESULTS = {"preview_ack", "duplicate"}
 _WORK_ITEM_KIND = "discord_interaction_work_item"
 _WORK_ITEM_STATUSES = {"queued", "duplicate"}
@@ -226,6 +229,29 @@ class DiscordInteractionWorkQueueSummary:
 
 
 @dataclass(frozen=True)
+class DiscordInteractionOperationsPreview:
+    """Read-only worker preview for safe livegate operations.
+
+    This intentionally carries side-effect flags so tests and reviewers can prove
+    the worker seam still does not write runtime DBs, send live messages, read env
+    secrets, or run shells/agents.
+    """
+
+    accepted: list[DiscordInteractionWorkQueueCandidate] = field(default_factory=list)
+    rejected: list[DiscordInteractionWorkQueueCandidate] = field(default_factory=list)
+    deferred: list[DiscordInteractionWorkQueueCandidate] = field(default_factory=list)
+    expired: int = 0
+    conflicted: int = 0
+    review_needed: int = 0
+    invalid_rows: int = 0
+    digest: str = ""
+    runtime_write: bool = False
+    live_send: bool = False
+    shell: bool = False
+    env_lookup: bool = False
+
+
+@dataclass(frozen=True)
 class DiscordInteractionEngineResult:
     """ACK plus explicit side-effect claims from a local wrapper engine."""
 
@@ -385,6 +411,14 @@ def _utc_timestamp() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _component_endpoint_version(payload: dict[str, Any]) -> str:
+    data = payload.get("data")
+    custom_id = data.get("custom_id") if isinstance(data, dict) else None
+    if isinstance(custom_id, str) and custom_id.startswith("q-decision:v1:"):
+        return "q-decision-v1"
+    return _FEEDBACK_ENDPOINT_VERSION
+
+
 def _feedback_event_to_json_row(event: DiscordInteractionFeedbackEvent) -> dict[str, Any]:
     row = asdict(event)
     row.pop("signature", None)
@@ -406,7 +440,7 @@ def validate_discord_feedback_event(event: Any) -> tuple[bool, str]:
         return False, "invalid_feedback_event"
     if event.kind != _FEEDBACK_KIND:
         return False, "invalid_feedback_kind"
-    if event.source != _FEEDBACK_SOURCE or event.endpoint_version != _FEEDBACK_ENDPOINT_VERSION:
+    if event.source != _FEEDBACK_SOURCE or event.endpoint_version not in _ALLOWED_ENDPOINT_VERSIONS:
         return False, "invalid_feedback_source"
     if event.signature or event.headers:
         return False, "unsafe_feedback_event"
@@ -448,7 +482,7 @@ def build_discord_feedback_event(
         action=action,
         review_id=review_id,
         source=_FEEDBACK_SOURCE,
-        endpoint_version=_FEEDBACK_ENDPOINT_VERSION,
+        endpoint_version=_component_endpoint_version(payload),
         result=result,
     )
     ok, _code = validate_discord_feedback_event(event)
@@ -498,7 +532,7 @@ def validate_discord_work_item(item: Any) -> tuple[bool, str]:
         return False, "invalid_work_item"
     if item.kind != _WORK_ITEM_KIND:
         return False, "invalid_work_item_kind"
-    if item.source != _FEEDBACK_SOURCE or item.endpoint_version != _FEEDBACK_ENDPOINT_VERSION:
+    if item.source != _FEEDBACK_SOURCE or item.endpoint_version not in _ALLOWED_ENDPOINT_VERSIONS:
         return False, "invalid_work_item_source"
     if item.signature or item.headers:
         return False, "unsafe_work_item"
@@ -542,7 +576,7 @@ def build_discord_work_item(
         action=action,
         review_id=review_id,
         source=_FEEDBACK_SOURCE,
-        endpoint_version=_FEEDBACK_ENDPOINT_VERSION,
+        endpoint_version=_component_endpoint_version(payload),
         status=status,
     )
     ok, _code = validate_discord_work_item(item)
@@ -776,6 +810,86 @@ def render_discord_work_queue_digest_ko(summary: DiscordInteractionWorkQueueSumm
     return "\n".join(lines)
 
 
+def filter_discord_work_queue_for_operations(
+    path: Path | str,
+    *,
+    now: str | datetime | None = None,
+    max_age_hours: int = 72,
+) -> DiscordInteractionOperationsPreview:
+    """Build a read-only operations preview from queued decisions.
+
+    This is the worker seam for livegate stabilization. It classifies safe
+    candidates but deliberately performs no runtime DB writes, no live sends, no
+    shell/agent execution, and no environment lookup.
+    """
+
+    summary = inspect_discord_work_queue(path)
+    current: datetime
+    if isinstance(now, datetime):
+        current = now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
+    elif isinstance(now, str):
+        parsed_now = _parse_queue_timestamp(now)
+        current = parsed_now if parsed_now is not None else datetime.now(UTC)
+    else:
+        current = datetime.now(UTC)
+    max_age = timedelta(hours=max(1, int(max_age_hours)))
+
+    accepted: list[DiscordInteractionWorkQueueCandidate] = []
+    rejected: list[DiscordInteractionWorkQueueCandidate] = []
+    deferred: list[DiscordInteractionWorkQueueCandidate] = []
+    expired = 0
+    conflicted = 0
+    review_needed = 0
+
+    for candidate in summary.candidates:
+        latest = _parse_queue_timestamp(candidate.latest_timestamp or "")
+        is_expired = latest is not None and current - latest > max_age
+        if is_expired:
+            expired += 1
+            continue
+        if "conflicting_actions" in candidate.warnings:
+            conflicted += 1
+            continue
+        if candidate.queued <= 0:
+            review_needed += 1
+            continue
+        if candidate.warnings or candidate.apply_candidate == "review_needed":
+            review_needed += 1
+            continue
+        if candidate.apply_candidate == "accepted":
+            accepted.append(candidate)
+        elif candidate.apply_candidate == "rejected":
+            rejected.append(candidate)
+        elif candidate.apply_candidate == "needs_review":
+            deferred.append(candidate)
+        else:
+            review_needed += 1
+
+    digest = "\n".join(
+        [
+            "🌈 Discord livegate 운영 preview",
+            f"- ✅ 승인 후보: {len(accepted)}",
+            f"- 🛑 거부 후보: {len(rejected)}",
+            f"- 🕊️ 보류 후보: {len(deferred)}",
+            f"- ⏳ 만료 제외: {expired}",
+            f"- ⚠️ 충돌 제외: {conflicted}",
+            f"- 🔎 추가 검토: {review_needed + summary.invalid_rows}",
+            "- 실제 적용은 아직 하지 않았습니다.",
+            "- DB write 없음. live send 없음. agent 실행 없음.",
+        ]
+    )
+    return DiscordInteractionOperationsPreview(
+        accepted=accepted,
+        rejected=rejected,
+        deferred=deferred,
+        expired=expired,
+        conflicted=conflicted,
+        review_needed=review_needed,
+        invalid_rows=summary.invalid_rows,
+        digest=digest,
+    )
+
+
 def _safe_route_path(value: Any) -> str:
     path = str(value or DISCORD_INTERACTION_ROUTE).strip()
     if not path.startswith("/") or "//" in path or any(ch in path for ch in "\r\n\x00"):
@@ -930,6 +1044,61 @@ def _safe_button_label(value: Any) -> str:
     return cleaned[:80]
 
 
+def _safe_card_text(value: Any, *, fallback: str, max_length: int = 700) -> str:
+    if not isinstance(value, str):
+        return fallback
+    cleaned = " ".join(value.replace("\r", " ").replace("\n", " ").replace("\x00", " ").split())
+    if not cleaned or _contains_secret_marker(cleaned):
+        return fallback
+    return cleaned[:max_length]
+
+
+def build_discord_decision_card_payload(
+    *,
+    title: str,
+    summary: str,
+    review_id: str,
+    custom_id_prefix: str = "q-decision:v1",
+) -> dict[str, Any]:
+    """Build a reusable Q decision card payload for Discord messages.
+
+    The callback still accepts the older MIM custom-id namespace for compatibility,
+    but new cards should use the neutral `q-decision:v1` namespace.
+    """
+
+    prefix = custom_id_prefix if custom_id_prefix == "q-decision:v1" else "q-decision:v1"
+    if _safe_component(review_id):
+        safe_review_id = review_id
+    else:
+        safe_review_id = "review-" + hashlib.sha256(str(review_id or "unsafe").encode("utf-8")).hexdigest()[:8]
+    safe_title = _safe_card_text(title, fallback="결정이 필요해요", max_length=120)
+    safe_summary = _safe_card_text(summary, fallback="요약을 확인하고 버튼으로 선택해 주세요.", max_length=700)
+    return {
+        "content": "\n".join(
+            [
+                f"🌈 {safe_title}",
+                "",
+                f"🧾 요약: {safe_summary}",
+                "",
+                "🛡️ 안전 경계",
+                "- 버튼 클릭은 append-only queue에만 남깁니다.",
+                "- 실제 적용은 별도 worker/review 단계에서만 진행합니다.",
+                "- 내부 원문/토큰/서명은 표시하지 않습니다.",
+            ]
+        ),
+        "components": [
+            {
+                "type": 1,
+                "components": [
+                    {"type": 2, "style": 3, "label": "승인 ✅", "custom_id": f"{prefix}:approve:{safe_review_id}"},
+                    {"type": 2, "style": 2, "label": "보류 🕊️", "custom_id": f"{prefix}:defer:{safe_review_id}"},
+                    {"type": 2, "style": 4, "label": "거부 🛑", "custom_id": f"{prefix}:reject:{safe_review_id}"},
+                ],
+            }
+        ],
+    }
+
+
 def _disabled_message_components(payload: dict[str, Any], *, selected_custom_id: str, action: str) -> list[dict[str, Any]]:
     """Copy the original component rows but make every button inert.
 
@@ -956,9 +1125,12 @@ def _disabled_message_components(payload: dict[str, Any], *, selected_custom_id:
         for component in components[:5]:
             if not isinstance(component, dict) or component.get("type") != 2:
                 continue
+            style = component.get("style")
+            if type(style) is not int or style not in {1, 2, 3, 4}:
+                style = 2
             safe_component: dict[str, Any] = {
                 "type": 2,
-                "style": component.get("style") if type(component.get("style")) is int else 2,
+                "style": style,
                 "label": _safe_button_label(component.get("label")),
                 "disabled": True,
             }
