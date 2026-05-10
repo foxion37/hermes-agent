@@ -659,7 +659,8 @@ def inspect_discord_work_queue(path: Path | str) -> DiscordInteractionWorkQueueS
 def _format_counts(counts: dict[str, int]) -> str:
     if not counts:
         return "없음"
-    return ", ".join(f"{key}: {value}" for key, value in sorted(counts.items()))
+    emojis = {"approve": "✅", "reject": "🛑", "defer": "🕊️"}
+    return ", ".join(f"{emojis.get(key, '•')} {key}: {value}" for key, value in sorted(counts.items()))
 
 
 def _redacted_label(prefix: str, value: str) -> str:
@@ -739,23 +740,23 @@ def render_discord_work_queue_digest_ko(summary: DiscordInteractionWorkQueueSumm
     if not summary.exists or summary.valid_items == 0:
         return "\n".join(
             [
-                "Discord 버튼 queue 요약",
+                "📬 Discord 버튼 queue 요약",
                 "- 아직 유효한 버튼 queue가 없습니다.",
                 "- 실제 적용은 아직 하지 않았습니다.",
-                "- DB write 없음.",
-                "- live send 없음.",
-                "- agent 실행 없음.",
+                "- 🛡️ DB write 없음.",
+                "- 📴 live send 없음.",
+                "- 🤖 agent 실행 없음.",
             ]
         )
     lines = [
-        "Discord 버튼 queue 요약",
-        f"- 총 유효 항목: {summary.valid_items}",
-        f"- 대기: {summary.queued}",
-        f"- 중복: {summary.duplicates}",
-        f"- action: {_format_counts(summary.action_counts)}",
-        f"- review: {_format_counts(summary.review_counts)}",
-        f"- 최신 시각: {summary.latest_timestamp or '없음'}",
-        f"- 무효/스킵 행: {summary.invalid_rows}",
+        "📬 Discord 버튼 queue 요약",
+        f"- ✅ 총 유효 항목: {summary.valid_items}",
+        f"- ⏳ 대기: {summary.queued}",
+        f"- 🔁 중복: {summary.duplicates}",
+        f"- 🎛️ action: {_format_counts(summary.action_counts)}",
+        f"- 🧾 review: {_format_counts(summary.review_counts)}",
+        f"- 🕒 최신 시각: {summary.latest_timestamp or '없음'}",
+        f"- ⚠️ 무효/스킵 행: {summary.invalid_rows}",
         "- 실제 적용은 아직 하지 않았습니다.",
         "- DB write 없음. live send 없음. agent 실행 없음.",
     ]
@@ -913,6 +914,83 @@ def _contains_secret_marker(value: str) -> bool:
     return _looks_like_secret_env(value)
 
 
+_ACTION_ACK_COPY = {
+    "approve": {"emoji": "✅", "label": "승인", "tone": "승인으로 기록했어요"},
+    "reject": {"emoji": "🛑", "label": "거부", "tone": "거부로 기록했어요"},
+    "defer": {"emoji": "🕊️", "label": "보류", "tone": "보류로 기록했어요"},
+}
+
+
+def _safe_button_label(value: Any) -> str:
+    if not isinstance(value, str):
+        return "선택지"
+    cleaned = " ".join(value.replace("\r", " ").replace("\n", " ").replace("\x00", " ").split())
+    if not cleaned or _contains_secret_marker(cleaned):
+        return "선택지"
+    return cleaned[:80]
+
+
+def _disabled_message_components(payload: dict[str, Any], *, selected_custom_id: str, action: str) -> list[dict[str, Any]]:
+    """Copy the original component rows but make every button inert.
+
+    Discord message-update ACKs need components in the response if the visible
+    buttons should change immediately. We preserve Discord's component shape, but
+    only copy the small allowlisted fields needed to render disabled buttons.
+    """
+
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return []
+    rows = message.get("components")
+    if not isinstance(rows, list):
+        return []
+    safe_rows: list[dict[str, Any]] = []
+    action_copy = _ACTION_ACK_COPY.get(action, _ACTION_ACK_COPY["defer"])
+    for row in rows[:5]:
+        if not isinstance(row, dict) or row.get("type") != 1:
+            continue
+        out_row: dict[str, Any] = {"type": 1, "components": []}
+        components = row.get("components")
+        if not isinstance(components, list):
+            continue
+        for component in components[:5]:
+            if not isinstance(component, dict) or component.get("type") != 2:
+                continue
+            safe_component: dict[str, Any] = {
+                "type": 2,
+                "style": component.get("style") if type(component.get("style")) is int else 2,
+                "label": _safe_button_label(component.get("label")),
+                "disabled": True,
+            }
+            custom_id = component.get("custom_id")
+            if isinstance(custom_id, str) and len(custom_id) <= 180 and "\n" not in custom_id and "\r" not in custom_id:
+                safe_component["custom_id"] = custom_id
+                if custom_id == selected_custom_id:
+                    safe_component["label"] = f"{action_copy['emoji']} 선택됨 · {action_copy['label']}"
+            out_row["components"].append(safe_component)
+        if out_row["components"]:
+            safe_rows.append(out_row)
+    return safe_rows
+
+
+def _decorated_decision_ack_content(action: str) -> str:
+    copy = _ACTION_ACK_COPY.get(action, _ACTION_ACK_COPY["defer"])
+    return "\n".join(
+        [
+            f"{copy['emoji']} {copy['tone']} ({action})",
+            "",
+            "🌱 다음 단계",
+            "- append-only queue에 안전하게 남길 준비를 했습니다. (queued)",
+            "- 실제 업데이트는 아직 실행하지 않았습니다.",
+            "",
+            "🛡️ 안전 경계",
+            "- DB write 없음",
+            "- 도구 설치/삭제 없음",
+            "- agent subprocess 실행 없음",
+        ]
+    )
+
+
 def build_discord_runner_input(payload: dict[str, Any]) -> DiscordInteractionRunnerInput | None:
     """Build the narrow preview-runner input from a validated component payload."""
 
@@ -992,11 +1070,21 @@ def build_discord_ack_preview(payload: dict[str, Any], dry_run_result: Any = Non
     if parsed is None:
         return None
     action, _review_id = parsed
+    selected_custom_id = payload.get("data", {}).get("custom_id") if isinstance(payload.get("data"), dict) else ""
+    components = _disabled_message_components(payload, selected_custom_id=selected_custom_id, action=action)
+    if components:
+        return {
+            "type": 7,
+            "data": {
+                "content": _decorated_decision_ack_content(action),
+                "components": components,
+            },
+        }
     return {
         "type": 4,
         "data": {
             "flags": 64,
-            "content": f"MIM queued: {action}",
+            "content": _decorated_decision_ack_content(action),
         },
     }
 

@@ -38,6 +38,7 @@ from gateway.discord_interactions import (
     DiscordInteractionWorkItem,
     DiscordInteractionWorkQueueCandidate,
     DiscordInteractionWorkQueueSummary,
+    build_discord_ack_preview,
     build_discord_interaction_engine,
     default_discord_signature_verifier,
     resolve_discord_interaction_config,
@@ -170,6 +171,50 @@ def test_preview_runner_receives_only_validated_contract_input_not_raw_payload()
         engine_name="mim-preview",
         ack={"type": 4, "data": {"flags": 64, "content": "runner preview: approve / review-123"}},
     )
+
+
+def test_button_ack_updates_message_with_disabled_components_and_friendly_korean_text():
+    payload = {
+        "type": 3,
+        "id": "interaction-disable",
+        "message": {
+            "content": "old decision card",
+            "components": [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 2,
+                            "style": 3,
+                            "label": "승인 ✅",
+                            "custom_id": "mim:soma-review:v1:approve:review-disable",
+                        },
+                        {
+                            "type": 2,
+                            "style": 2,
+                            "label": "보류 🕊️",
+                            "custom_id": "mim:soma-review:v1:defer:review-disable",
+                        },
+                    ],
+                }
+            ],
+        },
+        "data": {"custom_id": "mim:soma-review:v1:approve:review-disable"},
+    }
+
+    ack = build_discord_ack_preview(payload)
+
+    assert ack is not None
+    assert ack["type"] == 7
+    data = ack["data"]
+    assert "✅ 승인으로 기록했어요" in data["content"]
+    assert "실제 업데이트는 아직 실행하지 않았습니다" in data["content"]
+    assert "DB write 없음" in data["content"]
+    assert data["components"][0]["components"][0]["disabled"] is True
+    assert data["components"][0]["components"][1]["disabled"] is True
+    assert data["components"][0]["components"][0]["label"].startswith("✅ 선택됨")
+    assert "review-disable" not in data["content"]
+    assert "token" not in data["content"].lower()
 
 
 def test_preview_runner_result_rejects_side_effect_or_secret_shaped_output():
@@ -592,9 +637,9 @@ def test_queue_inspector_script_prints_read_only_korean_digest(tmp_path):
         [sys.executable, str(script), "--verbose", str(path)], capture_output=True, text=True, check=True
     )
 
-    assert "Discord 버튼 queue 요약" in result.stdout
+    assert "📬 Discord 버튼 queue 요약" in result.stdout
     assert "총 유효 항목: 1" in result.stdout
-    assert "approve: 1" in result.stdout
+    assert "✅ approve: 1" in result.stdout
     assert "후보 preview" in result.stdout
     assert "apply_candidate=accepted" in result.stdout
     assert "interaction-script" not in result.stdout
