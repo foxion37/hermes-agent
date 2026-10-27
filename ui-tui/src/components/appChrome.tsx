@@ -348,6 +348,7 @@ export interface StatusBarSegments {
   latency: boolean
   subagents: boolean
   tps: boolean
+  usageTok: boolean
   voice: boolean
 }
 
@@ -362,7 +363,8 @@ export function statusBarSegments(cols: number): StatusBarSegments {
     voice: w >= 84,
     bg: w >= 88,
     subagents: w >= 92,
-    cacheHit: w >= 96,
+    cacheHit: w >= 80,
+    usageTok: w >= 100,
     latency: w >= 104,
     tps: w >= 110
   }
@@ -621,7 +623,11 @@ export function StatusRule({
     stringWidth(modelText) +
     (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0)
 
-  const rightLabel = sessionTitle && ok('title') ? ` ${sessionTitle} ` : cwdLabel
+  // Session title and cwd:branch share the right slot (title first so it
+  // survives truncation of the longer cwd/branch tail).
+  const rightLabel =
+    sessionTitle && ok('title') ? (cwdLabel ? ` ${sessionTitle} · ${cwdLabel} ` : ` ${sessionTitle} `) : cwdLabel
+
   const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, rightLabel, essentialWidth)
 
   // Whole-segment progressive disclosure for the tail: a segment renders only
@@ -674,6 +680,17 @@ export function StatusRule({
   // cache reads, Codex app-server with no latency), so these self-hide.
   const cacheHitText = typeof usage.cache_hit_pct === 'number' ? `◎ ${usage.cache_hit_pct}%` : ''
   const showCacheHit = segs.cacheHit && ok('cache_hit') && !!cacheHitText && fits(SEP + stringWidth(cacheHitText))
+
+  // Session token in/out (+ cost when known) for the active model.
+  const usageTokText =
+    (usage.total ?? 0) > 0
+      ? `↓${compactNumber(usage.input ?? 0)} ↑${compactNumber(usage.output ?? 0)}${
+          typeof usage.cost_usd === 'number' && usage.cost_usd > 0
+            ? ` ${usage.cost_status === 'estimated' ? '~' : ''}$${usage.cost_usd.toFixed(2)}`
+            : ''
+        }`
+      : ''
+
   const latencyText = typeof usage.avg_latency_s === 'number' ? `◷ ${usage.avg_latency_s.toFixed(1)}s` : ''
   const showLatency = segs.latency && ok('latency') && !!latencyText && fits(SEP + stringWidth(latencyText))
   const tpsText = typeof usage.avg_tps === 'number' ? `↑ ${Math.round(usage.avg_tps)} t/s` : ''
@@ -697,6 +714,7 @@ export function StatusRule({
     subagentCount === 1 ? T.status.resumesWhenSubagentFinishes : T.status.resumesWhenSubagentsFinish(subagentCount)
 
   const showResumeHint = !busy && subagentCount > 0 && fits(SEP + stringWidth(resumeHintText))
+  const showUsageTok = segs.usageTok && ok('usage') && !!usageTokText && fits(SEP + stringWidth(usageTokText))
   // Dev-gated readout (HERMES_DEV_CREDITS), lowest priority,
   // so it consumes tail budget LAST and drops first on a narrow terminal.
   const showDevCredits = !!devCreditsText && fits(SEP + stringWidth(devCreditsText))
@@ -813,15 +831,21 @@ export function StatusRule({
             {' │ '}
             <Text
               color={
-                usage.cache_hit_pct! >= 70
+                (usage.cache_hit_pct ?? 0) >= 70
                   ? t.color.statusGood
-                  : usage.cache_hit_pct! >= 40
+                  : (usage.cache_hit_pct ?? 0) >= 40
                     ? t.color.statusWarn
                     : t.color.muted
               }
             >
               {cacheHitText}
             </Text>
+          </Text>
+        ) : null}
+        {showUsageTok ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            {usageTokText}
           </Text>
         ) : null}
         {showLatency ? (

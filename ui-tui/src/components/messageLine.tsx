@@ -225,7 +225,7 @@ export const MessageLine = memo(function MessageLine({
       const [head, ...rest] = userDisplay(msg.text).split('[long message]')
 
       return (
-        <Text color={body}>
+        <Text backgroundColor={t.color.completionBg} bold color={body}>
           {head}
           <Text color={t.color.muted} dimColor>
             {T.longMessage}
@@ -242,7 +242,11 @@ export const MessageLine = memo(function MessageLine({
       const segments = splitComposerHighlights(msg.text)
 
       return (
-        <Text {...(body ? { color: body } : {})}>
+        <Text
+          {...(body ? { color: body } : {})}
+          backgroundColor={t.color.completionBg}
+          bold
+        >
           {segments.map((segment, i) =>
             segment.ref ? (
               <Text color={t.color.accent} key={i}>
