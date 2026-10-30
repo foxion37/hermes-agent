@@ -22,14 +22,14 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'foxion37/hermes-agent' && github.ref == 'refs/heads/main' && contains(fromJSON('["push","workflow_dispatch","schedule"]'), github.event_name) && 'mac-mini-linux-arm64' || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: command -v rg >/dev/null || { sudo apt-get update && sudo apt-get install -y ripgrep; }
 
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
@@ -46,6 +46,9 @@ jobs:
       - name: Run tests
         run: |
           source .venv/bin/activate
+          if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            export PYTEST_XDIST_AUTO_NUM_WORKERS=2
+          fi
           python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
         env:
           # Ensure tests don't accidentally call real APIs
@@ -54,14 +57,14 @@ jobs:
           NOUS_API_KEY: ""
 
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'foxion37/hermes-agent' && github.ref == 'refs/heads/main' && contains(fromJSON('["push","workflow_dispatch","schedule"]'), github.event_name) && 'mac-mini-linux-arm64' || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: command -v rg >/dev/null || { sudo apt-get update && sudo apt-get install -y ripgrep; }
 
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5

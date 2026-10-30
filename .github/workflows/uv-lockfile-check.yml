@@ -67,7 +67,7 @@ concurrency:
 jobs:
   check:
     name: uv lock --check
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'foxion37/hermes-agent' && github.ref == 'refs/heads/main' && contains(fromJSON('["push","workflow_dispatch","schedule"]'), github.event_name) && 'mac-mini-linux-arm64' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Checkout code
