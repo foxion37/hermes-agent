@@ -66,6 +66,7 @@ def _ensure_discord_mock():
     discord_mod.DMChannel = type("DMChannel", (), {})
     discord_mod.Thread = type("Thread", (), {})
     discord_mod.ForumChannel = type("ForumChannel", (), {})
+    discord_mod.Forbidden = type("Forbidden", (Exception,), {})
     discord_mod.Interaction = object
     discord_mod.app_commands = SimpleNamespace(
         describe=lambda **kwargs: (lambda fn: fn),
@@ -324,11 +325,16 @@ def make_fake_guild(guild_id: int = GUILD_ID, name: str = "Test Server"):
     return SimpleNamespace(id=guild_id, name=name)
 
 
+async def _empty_channel_history(**_kwargs):
+    for message in ():
+        yield message
+
+
 def make_fake_text_channel(channel_id: int = CHANNEL_ID, name: str = "general", guild=None):
     return SimpleNamespace(
         id=channel_id, name=name,
         guild=guild or make_fake_guild(),
-        topic=None, type=0,
+        topic=None, type=0, history=_empty_channel_history,
     )
 
 
@@ -337,6 +343,7 @@ def make_fake_dm_channel(channel_id: int = 55555):
     ch.id = channel_id
     ch.name = "DM"
     ch.topic = None
+    ch.history = _empty_channel_history
     ch.__class__ = discord.DMChannel
     return ch
 
@@ -350,6 +357,7 @@ def make_fake_thread(thread_id: int = THREAD_ID, name: str = "test-thread", pare
     th.guild = th.parent.guild
     th.topic = None
     th.type = 11
+    th.history = _empty_channel_history
     th.__class__ = discord.Thread
     return th
 
