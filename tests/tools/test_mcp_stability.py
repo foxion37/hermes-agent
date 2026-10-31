@@ -95,7 +95,7 @@ class TestStdioPidTracking:
         # Should not raise
         _kill_orphaned_mcp_children()
 
-    def test_kill_orphaned_handles_dead_pids(self):
+    def test_kill_orphaned_handles_dead_pids(self, monkeypatch):
         """_kill_orphaned_mcp_children gracefully handles already-dead PIDs."""
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
@@ -103,13 +103,17 @@ class TestStdioPidTracking:
             _lock,
         )
 
-        # Use a PID that definitely doesn't exist
+        # Simulate a dead process without sending a real signal to an
+        # unverified PID, which the live-system guard intentionally blocks.
         fake_pid = 999999999
+        kill = MagicMock(side_effect=ProcessLookupError)
+        monkeypatch.setattr(os, "kill", kill)
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
 
         # Should not raise (ProcessLookupError is caught)
         _kill_orphaned_mcp_children()
+        kill.assert_any_call(fake_pid, signal.SIGTERM)
 
         with _lock:
             assert fake_pid not in _orphan_stdio_pids
