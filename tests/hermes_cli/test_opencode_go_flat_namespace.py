@@ -109,8 +109,7 @@ def test_openrouter_still_prepends_vendor():
 
 
 def _run_switch(raw_input: str, **extra):
-    """Call switch_model with opencode-go as current provider, mocking the
-    live catalog so the test doesn't hit the network."""
+    """Check opencode-go routing with deterministic catalog and validation."""
     defaults = dict(
         current_provider="opencode-go",
         current_model="kimi-k2.6",
@@ -126,9 +125,17 @@ def _run_switch(raw_input: str, **extra):
         # For other providers, return empty so tests don't depend on them.
         return []
 
-    with patch(
-        "hermes_cli.model_switch.list_provider_models",
-        side_effect=fake_list_provider_models,
+    with (
+        patch(
+            "hermes_cli.model_switch.list_provider_models",
+            side_effect=fake_list_provider_models,
+        ),
+        # This suite checks routing.  Keep the independent live endpoint
+        # validator from correcting the model to a changing remote catalog.
+        patch(
+            "hermes_cli.models.validate_requested_model",
+            return_value={"accepted": True, "persist": True, "recognized": True, "message": None},
+        ),
     ):
         return switch_model(raw_input=raw_input, **defaults)
 
