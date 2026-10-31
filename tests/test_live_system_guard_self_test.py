@@ -23,9 +23,8 @@ import subprocess
 
 import pytest
 
-# A guaranteed-foreign PID: PID 1 (init).  Owned by root, not us, and
-# always exists. A sane guard refuses to signal it.
-FOREIGN_PID = 1
+# A nonexistent PID keeps the guard self-test safe even after a regression.
+FOREIGN_PID = 2_000_000_000
 
 
 # ──────────────────── kill primitives ─────────────────────────
@@ -42,10 +41,53 @@ def test_os_kill_blocks_negative_one():
         os.kill(-1, signal.SIGTERM)
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork and setsid are POSIX-only")
+def test_os_kill_blocks_signaling_own_group():
+    # Isolate the child first so a regression cannot signal the CI runner.
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setsid()
+            os.kill(0, signal.SIGTERM)
+        except RuntimeError:
+            os._exit(0)
+        except BaseException:
+            os._exit(2)
+        os._exit(1)
+    _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
 def test_os_killpg_blocks_foreign_pgid():
+    # Do not use PID 1: on a container runner it may be our own group.
+    nonexistent_group = 2_000_000_000
     with pytest.raises(RuntimeError, match="live-system guard"):
-        os.killpg(FOREIGN_PID, signal.SIGTERM)
+        os.killpg(nonexistent_group, signal.SIGTERM)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
+def test_os_killpg_blocks_own_group(monkeypatch):
+    # A nonexistent PGID keeps this safe even if the guard regresses.
+    fake_own_group = 2_000_000_000
+    monkeypatch.setattr(os, "getpgrp", lambda: fake_own_group)
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        os.killpg(fake_own_group, signal.SIGTERM)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
+def test_os_killpg_allows_isolated_child_group():
+    pytest.importorskip("psutil")
+    child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    finally:
+        try:
+            child.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=2)
+    assert child.returncode == -signal.SIGTERM
 
 
 # ──────────────────── subprocess regex bypasses ────────────────

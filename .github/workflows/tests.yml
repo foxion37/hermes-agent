@@ -43,6 +43,11 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
+      - name: Verify process signal guard
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/test_live_system_guard_self_test.py -q -k test_os_kill -n 0
+
       - name: Run tests
         run: |
           source .venv/bin/activate

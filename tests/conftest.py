@@ -703,13 +703,8 @@ def _live_system_guard(request, monkeypatch):
         _initial_children = set()
 
     def _is_own_subtree(pid: int) -> bool:
-        # PID 0 means "our own process group"; -1 means "every process we
-        # can signal". Both are dangerous when paired with SIGTERM/SIGKILL,
-        # but pid 0 is technically scoped to our group so allow it; pid -1
-        # is treated as foreign (refuse).
-        if pid == 0:
-            return True
-        if pid < 0:
+        # Zero and negative PIDs target groups or all processes, not a child.
+        if pid <= 0:
             return False
         if pid == test_pid or pid in _initial_children:
             return True
@@ -718,8 +713,8 @@ def _live_system_guard(request, monkeypatch):
         try:
             walker = _psutil.Process(pid)
         except Exception:
-            # Stale PID — kill would be a no-op anyway, allow it.
-            return True
+            # A missing or unreadable PID cannot be proven to be our child.
+            return False
         try:
             for parent in walker.parents():
                 if parent.pid == test_pid:
@@ -731,6 +726,8 @@ def _live_system_guard(request, monkeypatch):
     real_kill = _os.kill
 
     def _guarded_kill(pid, sig, *args, **kwargs):
+        if sig == 0:
+            return real_kill(pid, sig, *args, **kwargs)
         if _is_own_subtree(int(pid)):
             return real_kill(pid, sig, *args, **kwargs)
         raise RuntimeError(
@@ -749,15 +746,20 @@ def _live_system_guard(request, monkeypatch):
     # ``os.killpg`` is the same risk class — sends a signal to every
     # process in a group. The gateway is a session leader (its own
     # PGID == its PID), so killpg(gateway_pid, SIGTERM) is a one-shot
-    # kill of the live process. Allow it only when the target PGID is
-    # the test process's own group.
+    # kill of the live process. The test's own group can also contain the
+    # CI runner or an interactive shell, so never signal it destructively.
     if hasattr(_os, "killpg"):
         real_killpg = _os.killpg
-        own_pgid = _os.getpgrp()
-
         def _guarded_killpg(pgid, sig, *args, **kwargs):
-            if int(pgid) == own_pgid or _is_own_subtree(int(pgid)):
+            pgid = int(pgid)
+            if sig == 0:
                 return real_killpg(pgid, sig, *args, **kwargs)
+            if pgid > 0 and pgid != _os.getpgrp() and pgid != test_pid:
+                try:
+                    if _os.getpgid(pgid) == pgid and _is_own_subtree(pgid):
+                        return real_killpg(pgid, sig, *args, **kwargs)
+                except OSError:
+                    pass
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
                 f"os.killpg({pgid}, {sig}) — PGID is outside the test "
