@@ -22,7 +22,8 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ${{ github.repository == 'foxion37/hermes-agent' && github.ref == 'refs/heads/main' && contains(fromJSON('["push","workflow_dispatch","schedule"]'), github.event_name) && 'mac-mini-linux-arm64' || 'ubuntu-latest' }}
+    # The full suite includes host-systemd and non-container audio checks.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout code
