@@ -279,3 +279,25 @@ def test_format_footer_served_model_is_opt_in_and_skips_same_model():
     assert format_runtime_footer(
         model="gpt-5.4", context_tokens=0, context_length=None, cwd="/x",
         served_model=None, fields=["served_model"]) == ""
+
+
+# ---------------------------------------------------------------------------
+# FooteredReply copy/pickle support
+# ---------------------------------------------------------------------------
+
+def test_footered_reply_survives_copy_and_pickle():
+    """A completion payload carries the reply object itself, so ``EventStream.publish`` deepcopies
+    it. ``deepcopy`` rebuilds a str subclass through ``cls.__new__(cls, value)``, which this
+    class's two-argument ``__new__`` cannot satisfy — the publish then raised TypeError and the
+    turn's final event never reached the viewer."""
+    import copy
+    import pickle
+
+    from gateway.runtime_footer import FooteredReply
+
+    reply = FooteredReply("본문", "gpt-5.4 · 5% · /var/data")
+    assert str(reply) == "본문\n\ngpt-5.4 · 5% · /var/data"
+    for clone in (copy.copy(reply), copy.deepcopy(reply), pickle.loads(pickle.dumps(reply))):
+        assert type(clone) is FooteredReply
+        assert str(clone) == str(reply)
+        assert clone.runtime_footer == reply.runtime_footer

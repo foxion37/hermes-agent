@@ -133,11 +133,24 @@ class FooteredReply(str):
     """A final reply whose text ends with ``\n\n<runtime_footer>``. Plain text everywhere; any
     rewrite yields a plain ``str`` again, so the footer then simply stays in the text."""
     runtime_footer: str
+    _text: str
 
     def __new__(cls, text: str, footer: str):
         instance = super().__new__(cls, f"{text}\n\n{footer}")
         instance.runtime_footer = footer
+        instance._text = text
         return instance
+
+    def __reduce__(self):
+        # copy/deepcopy/pickle rebuild a str subclass through ``cls.__new__(cls, value)``, which
+        # cannot satisfy this class's two-argument ``__new__``: the completion payload handed to
+        # ``EventStream.publish`` raised "missing 1 required positional argument: 'footer'" and the
+        # turn's final event never reached the viewer (#FooteredReply-deepcopy).
+        return (self.__class__, (self._text, self.runtime_footer))
+
+    def __deepcopy__(self, memo):
+        # Same guarantee without walking a str of unbounded length.
+        return self.__class__(self._text, self.runtime_footer)
 
 
 class _FooterCaption(str):
